@@ -1,0 +1,165 @@
+[
+  {
+    "region_name": "Limgrave",
+    "regions": [ 1000, 1800, 3000, 3001, 3002, 3004, 3011, 3100, 3101, 3102, 3103, 3115, 3117, 3200, 3201, 3410, 6100, 6101, 6102 ],
+    "bosses": [
+      { "boss": "[3] Margit, the Fell Omen", "place": "Stormveil Castle", "flag_id": 10000850 },
+      { "boss": "[4] Godrick the Grafted", "place": "Stormveil Castle", "flag_id": 10000800, "rememberance": 1 }
+    ]
+  },
+  {
+    "region_name": "Liurnia of the Lakes",
+    "regions": [ 1400, 3003, 3005, 3006, 3104, 3105, 3106, 3202, 3411, 3900, 3920, 6200, 6201 ],
+    "bosses": [
+      { "boss": "[6] Red Wolf of Radagon", "place": "", "flag_id": 14000850 },
+      { "boss": "[7] Rennala, Queen of the Full Moon", "place": "", "flag_id": 14000800, "rememberance": 2 }
+    ]
+  },
+  {
+    "region_name": "Altus Plateau",
+    "regions": [ 3007, 3008, 3012, 3118, 3119, 3204, 3205, 6300, 3010, 3013, 3412, 6301, 1100, 3414, 3415, 3500 ],
+    "bosses": [
+      { "boss": "[11] Draconic Tree Sentinel", "place": "Capital Rampart", "flag_id": 1045520800 },
+      { "boss": "[11] Godfrey, First Elden Lord", "place": "Erdtree Sanctuary", "flag_id": 11000850 },
+      { "boss": "[11] Morgott, the Omen King", "place": "Elden Throne", "flag_id": 11000800, "rememberance": 4 }
+    ]
+  },
+  {
+    "region_name": "Mt. Gelmir",
+    "regions": [ 3009, 3107, 3109, 6302, 1600 ],
+    "bosses": [
+      { "boss": "[11] Godskin Noble", "place": "Temple of Eiglay", "flag_id": 16000850 },
+      { "boss": "[12] God-Devouring Serpent & Rykard, Lord of Blasphemy", "place": "Volcano Manor", "flag_id": 16000800, "rememberance": 5 }
+    ]
+  },
+  {
+    "region_name": "Caelid",
+    "regions": [ 3014, 3015, 3121, 3207, 3208, 6400, 3120, 3111, 3016, 3110, 3413, 6402 ],
+    "bosses": [
+      { "boss": "[10] Starscourge Radahn", "place": "Wailing Dunes", "flag_id": 1252380800, "rememberance": 3 }
+    ]
+  },
+  {
+    "region_name": "Mountaintops of the Giants",
+    "regions": [ 3017, 3018, 3122, 6501, 6502, 6500 ],
+    "bosses": [
+      { "boss": "[14] Fire Giant", "place": "Flame Peak", "flag_id": 1052520800, "rememberance": 6 }
+    ]
+  },
+  {
+    "region_name": "Crumbling Farum Azula",
+    "regions": [ 1300 ],
+    "bosses": [
+      { "boss": "[14] Godskin Duo", "place": "Dragon Temple Altar", "flag_id": 13000850 },
+      { "boss": "[17] Dragonlord Placidusax", "place": "Beside the Great Bridge", "flag_id": 13000830, "rememberance": 12 },
+      { "boss": "[15] Maliketh, the Black Blade", "place": "", "flag_id": 13000800, "rememberance": 11 }
+    ]
+  },
+  {
+    "region_name": "Leyndell, Ashen Capital",
+    "regions": [ 1105, 1900 ],
+    "bosses": [
+      { "boss": "[15] Sir Gideon Ofnir, the All-Knowing", "place": "Erdtree Sanctuary", "flag_id": 11050850 },
+      { "boss": "[16] Godfrey, First Elden Lord", "place": "Elden Throne", "flag_id": 11050800, "rememberance": 14 },
+      { "boss": "[17] Radagon of the Golden Order & Elden Beast", "place": "Fractured Marika", "flag_id": 19000800, "rememberance": 15 }
+    ]
+  },
+  {
+    "region_name": "Miquella's Haligtree",
+    "regions": [ 1500 ],
+    "bosses": [
+      { "boss": "[18] Loretta, Knight of the Haligtree", "place": "", "flag_id": 15000850 },
+      { "boss": "[20] Malenia, Blade of Miquella & Malenia, Goddess of Rot", "place": "", "flag_id": 15000800, "rememberance": 13 }
+    ]
+  },
+  {
+    "region_name": "Underground",
+    "regions": [ 1202, 1207, 1201, 1203, 1204 ],
+    "bosses": [
+      { "boss": "[9] Mimic Tear", "place": "", "flag_id": 12020850 },
+      { "boss": "[9] Regal Ancestor Spirit", "place": "Hallowhorn Grounds", "flag_id": 12090800, "rememberance": 7 },
+      { "boss": "[9] Valiant Gargoyles", "place": "Siofra Aqueduct", "flag_id": 12020800 },
+      { "boss": "[11] Fia's Champion & Sorcerer Rogier & Lionel the Lionhearted", "place": "", "flag_id": 12030800 },
+      { "boss": "[11] Lichdragon Fortissax", "place": "", "flag_id": 12030850, "rememberance": 9 },
+      { "boss": "[11] Astel, Naturalborn of the Void", "place": "Grand Cloister", "flag_id": 12040800, "rememberance": 8 }
+    ]
+  },
+  {
+    "region_name": "Mohgwyn Dynasty Mausoleum",
+    "regions": [ 1205 ],
+    "bosses": [
+      { "boss": "[18] Mohg, Lord of Blood", "place": "", "flag_id": 12050800, "rememberance": 10 }
+    ]
+  },
+  {
+    "region_name": "Gravesite Plain",
+    "regions": [ 4000, 4100, 4300, 4301, 6800, 6801, 6804, 6805, 6806, 6810, 6815, 6820 ],
+    "bosses": [
+      { "boss": "[24] Divine Beast Dancing Lion", "place": "Belurat, Tower Settlement", "flag_id": 20000800, "rememberance": 16 },
+      { "boss": "[23] Ancient Dragon-Man", "place": "Dragon's Pit", "flag_id": 43010800 },
+      { "boss": "[26] Rellana, Twin Moon Knight", "place": "Castle Ensis", "flag_id": 2048440800, "rememberance": 17 }
+    ],
+    "dlc": 1
+  },
+  {
+    "region_name": "Scadu Altus",
+    "regions": [ 2100, 2101, 2102, 4001, 4101, 6900, 6901, 6902, 6904, 6905, 6906, 6920, 6960 ],
+    "bosses": [
+      { "boss": "[29] Commander Gaius", "place": "", "flag_id": 2049480800, "rememberance": 19 },
+      { "boss": "[28] Scadutree Avatar", "place": "Scadutree Base", "flag_id": 2050480800, "rememberance": 24 },
+      { "boss": "[27] Golden Hippopotamus", "place": "Shadow Keep", "flag_id": 21000850 },
+      { "boss": "[30] Messmer the Impaler & Base Serpent Messmer", "place": "Shadow Keep", "flag_id": 21010800, "rememberance": 20 }
+    ],
+    "dlc": 1
+  },
+  {
+    "region_name": "Hinterlands",
+    "regions": [ 2500, 6930 ],
+    "bosses": [
+      { "boss": "[32] Metyr, Mother of Fingers", "place": "Cathedral of Manus Metyr", "flag_id": 25000800, "rememberance": 18 },
+      { "boss": "[25] Count Ymir, Mother of Fingers", "place": "Cathedral of Manus Metyr", "flag_id": 2051450800 }
+    ],
+    "dlc": 1
+  },
+  {
+    "region_name": "Cerulean Coast",
+    "regions": [ 2200, 6830, 6835 ],
+    "bosses": [
+      { "boss": "[28] Putrescent Knight", "place": "Stone Coffin Fissure", "flag_id": 22000800, "rememberance": 22 }
+    ],
+    "dlc": 1
+  },
+  {
+    "region_name": "Jagged Peak",
+    "regions": [ 6841, 6850, 4102, 6840 ],
+    "bosses": [
+      { "boss": "[34] Bayle the Dread", "place": "Jagged Peak Summit", "flag_id": 2054390800 }
+    ],
+    "dlc": 1
+  },
+  {
+    "region_name": "Abyssal Woods",
+    "regions": [ 2800, 4002, 6860, 6903 ],
+    "bosses": [
+      { "boss": "[31] Jori, Elder Inquisitor", "place": "Darklight Catacombs", "flag_id": 2052430800 },
+      { "boss": "[32] Midra, Lord of Frenzied Flame", "place": "Midra's Manse", "flag_id": 28000800, "rememberance": 23 }
+    ],
+    "dlc": 1
+  },
+  {
+    "region_name": "Ancient Ruins of Rauh",
+    "regions": [ 6940, 6941 ],
+    "bosses": [
+      { "boss": "[32] Romina, Saint of the Bud", "place": "Church of the Bud", "flag_id": 2044450800, "rememberance": 21 }
+    ],
+    "dlc": 1
+  },
+  {
+    "region_name": "Enir-Ilim",
+    "regions": [ 2001 ],
+    "bosses": [
+      { "boss": "[33] Promised Consort Radahn & Radahn, Consort of Miquella", "place": "", "flag_id": 20010800, "rememberance": 25 }
+    ],
+    "dlc": 1
+  }
+]
