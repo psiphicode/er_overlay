@@ -8,4 +8,5 @@ pub mod layout;
 pub mod runtime;
 pub mod style;
 pub mod ui;
+pub mod victory;
 pub mod view_model;

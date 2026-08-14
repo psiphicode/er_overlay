@@ -120,13 +120,32 @@ pub fn normalize_swap_chain_framebuffer_scale(_ui: &Ui) -> Option<[f32; 2]> {
     Some(reported)
 }
 
-pub fn render_centered_text(ui: &Ui, lines: &[String]) {
-    let total_height = ui.text_line_height_with_spacing() * lines.len() as f32;
+fn centered_line_x(cursor_x: f32, available_width: f32, text_width: f32) -> f32 {
+    cursor_x + ((available_width - text_width) * 0.5).max(0.0)
+}
+
+pub fn render_centered_line(ui: &Ui, text: &str) {
+    let cursor = ui.cursor_pos();
+    let x = centered_line_x(
+        cursor[0],
+        ui.content_region_avail()[0],
+        ui.calc_text_size(text)[0],
+    );
+    ui.set_cursor_pos([x, cursor[1]]);
+    ui.text(text);
+}
+
+pub fn render_centered_text(ui: &Ui, title: Option<&str>, lines: &[String]) {
+    let line_count = lines.len() + usize::from(title.is_some());
+    let total_height = ui.text_line_height_with_spacing() * line_count as f32;
     let offset = (ui.content_region_avail()[1] - total_height) * 0.5;
     if offset > 0.0 {
         let mut position = ui.cursor_pos();
         position[1] += offset;
         ui.set_cursor_pos(position);
+    }
+    if let Some(title) = title {
+        render_centered_line(ui, title);
     }
     for line in lines {
         ui.text(line);
@@ -150,7 +169,7 @@ pub fn header_clicked(ui: &Ui, height: f32) -> bool {
 mod tests {
     use imgui::Context;
 
-    use super::{OverlayLayout, normalize_swap_chain_framebuffer_scale};
+    use super::{OverlayLayout, centered_line_x, normalize_swap_chain_framebuffer_scale};
 
     fn assert_visible(position: [f32; 2], size: [f32; 2], display: [f32; 2]) {
         for axis in 0..2 {
@@ -240,5 +259,11 @@ mod tests {
 
         let draw_data = imgui.render();
         assert_eq!(draw_data.framebuffer_scale, [1.0, 1.0]);
+    }
+
+    #[test]
+    fn centers_title_without_moving_past_the_current_cursor() {
+        assert_eq!(centered_line_x(8.0, 200.0, 80.0), 68.0);
+        assert_eq!(centered_line_x(8.0, 40.0, 80.0), 8.0);
     }
 }

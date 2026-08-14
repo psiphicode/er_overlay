@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 pub struct AppState {
     pub key_item_quantity: u32,
     pub event_flags: HashMap<i32, bool>,
+    pub goal_complete: bool,
     pub initialized: bool,
     pub death_count: u32,
     pub great_runes: i32,

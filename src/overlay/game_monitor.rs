@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc, RwLock,
+        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -11,7 +11,11 @@ use std::{
 use crate::{
     debug_log,
     er::{events::EventFlagCache, gamedata::read_game_data, inventory::get_key_item_quantity},
-    overlay::{config::SharedConfig, data::SharedState},
+    overlay::{
+        config::{ConfigSnapshot, SharedConfig, VictoryCondition},
+        data::SharedState,
+        victory::VictoryTracker,
+    },
 };
 
 const GREAT_RUNE_FLAGS: [i32; 7] = [181, 182, 183, 184, 185, 186, 187];
@@ -21,53 +25,157 @@ pub(crate) fn is_great_rune_flag(flag_id: i32) -> bool {
     GREAT_RUNE_FLAGS.contains(&flag_id)
 }
 
-#[derive(Debug, Default)]
-struct IgtFreezeLatch {
-    flag_id: Option<i32>,
-    frozen: bool,
-}
-
-impl IgtFreezeLatch {
-    fn new(flag_id: Option<i32>) -> Self {
-        Self {
-            flag_id,
-            frozen: false,
+fn write_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    match lock.write() {
+        Ok(guard) => guard,
+        Err(error) => {
+            lock.clear_poison();
+            error.into_inner()
         }
-    }
-
-    fn reconfigure(&mut self, flag_id: Option<i32>) -> bool {
-        if self.flag_id == flag_id {
-            return false;
-        }
-        self.flag_id = flag_id;
-        self.frozen = false;
-        true
-    }
-
-    fn observe(&mut self, flag_id: i32, active: bool) -> bool {
-        if !self.frozen && active && self.flag_id == Some(flag_id) {
-            self.frozen = true;
-            return true;
-        }
-        false
     }
 }
 
-fn configured_freeze_flag(config: &SharedConfig) -> Option<i32> {
-    config
-        .read()
-        .ok()
-        .and_then(|snapshot| snapshot.config.as_ref()?.timer.freeze_on_boss_flag)
+fn read_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    match lock.read() {
+        Ok(guard) => guard,
+        Err(error) => {
+            lock.clear_poison();
+            error.into_inner()
+        }
+    }
 }
 
-fn create_flag_cache(boss_flag_ids: &HashSet<i32>, freeze_flag: Option<i32>) -> EventFlagCache {
-    EventFlagCache::new(
-        boss_flag_ids
-            .iter()
-            .copied()
-            .chain(GREAT_RUNE_FLAGS.iter().copied())
-            .chain(freeze_flag),
+fn initial_state_snapshot(state: &SharedState) -> (HashMap<i32, bool>, u32, u32, i32, bool) {
+    let state = read_unpoisoned(state);
+    (
+        state.event_flags.clone(),
+        state.key_item_quantity,
+        state.death_count,
+        state.great_runes,
+        state.goal_complete,
     )
+}
+
+fn initial_published_igt(igt: &RwLock<u32>) -> u32 {
+    *read_unpoisoned(igt)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ConfiguredVictory {
+    revision: u64,
+    condition: VictoryCondition,
+}
+
+impl From<&ConfigSnapshot> for ConfiguredVictory {
+    fn from(snapshot: &ConfigSnapshot) -> Self {
+        Self {
+            revision: snapshot.revision,
+            condition: snapshot
+                .config
+                .as_ref()
+                .map(|config| config.victory.clone())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SampleObservation {
+    Current(bool),
+    Stale(ConfiguredVictory),
+}
+
+fn configured_victory(config: &SharedConfig) -> ConfiguredVictory {
+    let snapshot = read_unpoisoned(config);
+    ConfiguredVictory::from(&*snapshot)
+}
+
+fn reconfigure_victory(
+    configured: &mut ConfiguredVictory,
+    latest: ConfiguredVictory,
+    victory: &mut VictoryTracker,
+) -> bool {
+    if *configured == latest {
+        return false;
+    }
+    let reconfigured = victory.reconfigure(latest.condition.clone());
+    *configured = latest;
+    reconfigured
+}
+
+fn observe_if_current(
+    config: &SharedConfig,
+    sampled_revision: u64,
+    game_time: Option<u32>,
+    victory: &mut VictoryTracker,
+    values: &HashMap<i32, bool>,
+    unresolved: &[i32],
+) -> SampleObservation {
+    let snapshot = read_unpoisoned(config);
+    if snapshot.revision != sampled_revision {
+        return SampleObservation::Stale(ConfiguredVictory::from(&*snapshot));
+    }
+    if game_time.is_none() {
+        return SampleObservation::Current(false);
+    }
+    SampleObservation::Current(victory.observe(values, unresolved))
+}
+
+fn monitored_flag_ids(boss_flag_ids: &HashSet<i32>, victory: &VictoryTracker) -> HashSet<i32> {
+    boss_flag_ids
+        .iter()
+        .copied()
+        .chain(GREAT_RUNE_FLAGS)
+        .chain(victory.requested_flag_ids())
+        .collect()
+}
+
+fn create_flag_cache(boss_flag_ids: &HashSet<i32>, victory: &VictoryTracker) -> EventFlagCache {
+    EventFlagCache::new(monitored_flag_ids(boss_flag_ids, victory))
+}
+
+fn merge_boss_flags(
+    published: &mut HashMap<i32, bool>,
+    sampled: &HashMap<i32, bool>,
+    boss_flag_ids: &HashSet<i32>,
+) -> bool {
+    let mut changed = false;
+    for flag_id in boss_flag_ids {
+        if let Some(value) = sampled.get(flag_id)
+            && published.insert(*flag_id, *value) != Some(*value)
+        {
+            changed = true;
+        }
+    }
+    changed
+}
+
+struct MonitorStateUpdate {
+    event_flags: Option<HashMap<i32, bool>>,
+    key_item_quantity: u32,
+    death_count: u32,
+    great_runes: i32,
+    goal_complete: bool,
+}
+
+fn publish_state_after_igt(
+    state: &SharedState,
+    igt: &RwLock<u32>,
+    game_time: Option<u32>,
+    update: MonitorStateUpdate,
+) {
+    if let Some(game_time) = game_time {
+        *write_unpoisoned(igt) = game_time;
+    }
+    let mut state = write_unpoisoned(state);
+    if let Some(event_flags) = update.event_flags {
+        state.event_flags = event_flags;
+    }
+    state.key_item_quantity = update.key_item_quantity;
+    state.death_count = update.death_count;
+    state.great_runes = update.great_runes;
+    state.goal_complete = update.goal_complete;
+    state.initialized = true;
 }
 
 pub fn start_game_monitor(
@@ -85,70 +193,84 @@ pub fn start_game_monitor(
             .into_iter()
             .filter(|flag_id| !is_great_rune_flag(*flag_id))
             .collect();
-        let mut igt_freeze = IgtFreezeLatch::new(configured_freeze_flag(&config));
-        let mut flag_cache = create_flag_cache(&boss_flag_ids, igt_freeze.flag_id);
+        let mut configured = configured_victory(&config);
+        let mut victory =
+            VictoryTracker::new(configured.condition.clone(), boss_flag_ids.iter().copied());
+        let mut flag_cache = create_flag_cache(&boss_flag_ids, &victory);
         let (
             mut published_flags,
             mut published_quantity,
             mut published_deaths,
             mut published_runes,
-        ) = state
-            .read()
-            .map(|state| {
-                (
-                    state.event_flags.clone(),
-                    state.key_item_quantity,
-                    state.death_count,
-                    state.great_runes,
-                )
-            })
-            .unwrap_or_default();
+            mut published_goal_complete,
+        ) = initial_state_snapshot(&state);
         let previous_flag_count = published_flags.len();
         published_flags.retain(|flag_id, _| boss_flag_ids.contains(flag_id));
         let mut boss_flags_need_publish = published_flags.len() != previous_flag_count;
         let mut sampled_rune_flags = HashMap::with_capacity(GREAT_RUNE_FLAGS.len());
-        let mut published_igt = igt.read().map(|value| *value).unwrap_or_default();
+        let mut published_igt = initial_published_igt(&igt);
         let mut next_flag_error_log = Instant::now();
         let mut last_unresolved_count = None;
 
         while !stop.load(Ordering::Acquire) {
             let cycle_started = Instant::now();
-            let configured_flag = configured_freeze_flag(&config);
-            if igt_freeze.reconfigure(configured_flag) {
-                flag_cache = create_flag_cache(&boss_flag_ids, configured_flag);
+            let latest = configured_victory(&config);
+            if reconfigure_victory(&mut configured, latest, &mut victory) {
+                flag_cache = create_flag_cache(&boss_flag_ids, &victory);
                 last_unresolved_count = None;
-                match configured_flag {
-                    Some(flag_id) => debug_log!(
-                        "[ignite_overlay] IGT freeze flag changed to {flag_id}; timer resumed until it activates"
-                    ),
-                    None => debug_log!("[ignite_overlay] IGT freeze flag disabled; timer resumed"),
-                }
+                debug_log!(
+                    "[ignite_overlay] Victory condition changed to {:?}",
+                    victory.condition()
+                );
             }
 
             let mut flags_changed = boss_flags_need_publish;
-            let mut igt_froze_this_cycle = false;
+            let mut completed_this_cycle = false;
+            let game_data = read_game_data();
             match flag_cache.sample(cycle_started) {
                 Ok(sample) => {
-                    for (flag_id, value) in sample.values {
-                        igt_froze_this_cycle |= igt_freeze.observe(flag_id, value);
-                        if is_great_rune_flag(flag_id) {
-                            sampled_rune_flags.insert(flag_id, value);
-                        } else if boss_flag_ids.contains(&flag_id)
-                            && published_flags.insert(flag_id, value) != Some(value)
-                        {
-                            flags_changed = true;
-                        }
-                    }
-                    let unresolved_count = sample.unresolved.len();
-                    if last_unresolved_count != Some(unresolved_count) {
-                        if unresolved_count != 0 {
-                            debug_log!(
-                                "[event_flags] {unresolved_count} requested flags are not currently resolvable; retrying"
+                    match observe_if_current(
+                        &config,
+                        configured.revision,
+                        game_data.map(|snapshot| snapshot.play_time_ms),
+                        &mut victory,
+                        &sample.values,
+                        &sample.unresolved,
+                    ) {
+                        SampleObservation::Current(completed) => {
+                            completed_this_cycle = completed;
+                            flags_changed |= merge_boss_flags(
+                                &mut published_flags,
+                                &sample.values,
+                                &boss_flag_ids,
                             );
-                        } else if last_unresolved_count.is_some_and(|count| count != 0) {
-                            debug_log!("[event_flags] All requested flags resolved");
+                            for (flag_id, value) in sample.values {
+                                if is_great_rune_flag(flag_id) {
+                                    sampled_rune_flags.insert(flag_id, value);
+                                }
+                            }
+                            let unresolved_count = sample.unresolved.len();
+                            if last_unresolved_count != Some(unresolved_count) {
+                                if unresolved_count != 0 {
+                                    debug_log!(
+                                        "[event_flags] {unresolved_count} requested flags are not currently resolvable; retrying"
+                                    );
+                                } else if last_unresolved_count.is_some_and(|count| count != 0) {
+                                    debug_log!("[event_flags] All requested flags resolved");
+                                }
+                                last_unresolved_count = Some(unresolved_count);
+                            }
                         }
-                        last_unresolved_count = Some(unresolved_count);
+                        SampleObservation::Stale(latest) => {
+                            if reconfigure_victory(&mut configured, latest, &mut victory) {
+                                flag_cache = create_flag_cache(&boss_flag_ids, &victory);
+                                last_unresolved_count = None;
+                                debug_log!(
+                                    "[ignite_overlay] Victory condition changed to {:?}",
+                                    victory.condition()
+                                );
+                            }
+                        }
                     }
                 }
                 Err(error) => {
@@ -164,42 +286,52 @@ pub fn start_game_monitor(
                 .filter(|flag| sampled_rune_flags.get(flag).copied().unwrap_or(false))
                 .count() as i32;
             let quantity = get_key_item_quantity(key_item_id);
-            let game_data = read_game_data();
             let deaths = game_data
                 .map(|snapshot| snapshot.death_count)
                 .unwrap_or(published_deaths);
             let state_changed = flags_changed
                 || quantity != published_quantity
                 || deaths != published_deaths
-                || runes != published_runes;
-            if state_changed && let Ok(mut state) = state.write() {
+                || runes != published_runes
+                || victory.is_complete() != published_goal_complete;
+            let game_time_to_publish = if !victory.is_complete() || completed_this_cycle {
+                game_data
+                    .map(|snapshot| snapshot.play_time_ms)
+                    .filter(|game_time| *game_time != published_igt)
+            } else {
+                None
+            };
+            if state_changed {
+                publish_state_after_igt(
+                    &state,
+                    &igt,
+                    game_time_to_publish,
+                    MonitorStateUpdate {
+                        event_flags: flags_changed.then(|| published_flags.clone()),
+                        key_item_quantity: quantity,
+                        death_count: deaths,
+                        great_runes: runes,
+                        goal_complete: victory.is_complete(),
+                    },
+                );
                 if flags_changed {
-                    state.event_flags = published_flags.clone();
                     boss_flags_need_publish = false;
                 }
-                state.key_item_quantity = quantity;
-                state.death_count = deaths;
-                state.great_runes = runes;
-                state.initialized = true;
                 published_quantity = quantity;
                 published_deaths = deaths;
                 published_runes = runes;
-            }
-
-            if (!igt_freeze.frozen || igt_froze_this_cycle)
-                && let Some(game_time) = game_data.map(|snapshot| snapshot.play_time_ms)
-                && game_time != published_igt
-                && let Ok(mut in_game_time) = igt.write()
-            {
+                published_goal_complete = victory.is_complete();
+            } else if let Some(game_time) = game_time_to_publish {
+                let mut in_game_time = write_unpoisoned(&igt);
                 *in_game_time = game_time;
+            }
+            if let Some(game_time) = game_time_to_publish {
                 published_igt = game_time;
             }
-            if igt_froze_this_cycle {
+            if completed_this_cycle {
                 debug_log!(
-                    "[ignite_overlay] IGT frozen at {published_igt} ms after event flag {} activated",
-                    igt_freeze
-                        .flag_id
-                        .expect("a configured flag triggered the latch")
+                    "[ignite_overlay] Victory condition {:?} completed at {published_igt} ms",
+                    victory.condition()
                 );
             }
 
@@ -213,32 +345,306 @@ pub fn start_game_monitor(
 
 #[cfg(test)]
 mod tests {
-    use super::IgtFreezeLatch;
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::{Arc, RwLock},
+        thread,
+        time::{Duration, Instant},
+    };
 
-    #[test]
-    fn freezes_only_when_the_configured_flag_activates() {
-        let mut latch = IgtFreezeLatch::new(Some(123));
+    use crate::overlay::{
+        config::{ConfigSnapshot, RuntimeConfig, SharedConfig, VictoryCondition},
+        data::create_state,
+        style::IgniteConfig,
+        victory::VictoryTracker,
+    };
 
-        assert!(!latch.observe(122, true));
-        assert!(!latch.frozen);
-        assert!(!latch.observe(123, false));
-        assert!(!latch.frozen);
-        assert!(latch.observe(123, true));
-        assert!(latch.frozen);
-        assert!(!latch.observe(123, true));
+    use super::{
+        ConfiguredVictory, GREAT_RUNE_FLAGS, MonitorStateUpdate, SampleObservation,
+        configured_victory, initial_published_igt, initial_state_snapshot, merge_boss_flags,
+        monitored_flag_ids, observe_if_current, publish_state_after_igt, reconfigure_victory,
+        write_unpoisoned,
+    };
+
+    fn runtime_with_victory(victory: VictoryCondition) -> Arc<RuntimeConfig> {
+        let mut runtime = RuntimeConfig::try_from(IgniteConfig {
+            common: None,
+            input: None,
+            style: None,
+            boss: None,
+            overlay: None,
+            timer: None,
+            victory: None,
+        })
+        .unwrap();
+        runtime.victory = victory;
+        Arc::new(runtime)
+    }
+
+    fn shared_config(revision: u64, victory: VictoryCondition) -> SharedConfig {
+        Arc::new(RwLock::new(ConfigSnapshot {
+            revision,
+            config: Some(runtime_with_victory(victory)),
+        }))
     }
 
     #[test]
-    fn changing_or_disabling_the_flag_resets_the_latch() {
-        let mut latch = IgtFreezeLatch::new(Some(123));
-        assert!(latch.observe(123, true));
+    fn monitor_targets_include_victory_ids_without_making_them_bosses() {
+        let boss_ids = HashSet::from([1, 2]);
+        let tracker = VictoryTracker::new(VictoryCondition::BossIds(vec![20, 30]), [1, 2]);
+        let monitored = monitored_flag_ids(&boss_ids, &tracker);
 
-        assert!(!latch.reconfigure(Some(123)));
-        assert!(latch.frozen);
-        assert!(latch.reconfigure(Some(456)));
-        assert!(!latch.frozen);
-        assert!(latch.reconfigure(None));
-        assert!(!latch.frozen);
-        assert!(!latch.observe(456, true));
+        assert!(monitored.is_superset(&HashSet::from([1, 2, 20, 30])));
+        assert!(GREAT_RUNE_FLAGS.iter().all(|id| monitored.contains(id)));
+
+        let mut published = HashMap::new();
+        assert!(merge_boss_flags(
+            &mut published,
+            &HashMap::from([(1, true), (20, true)]),
+            &boss_ids,
+        ));
+        assert_eq!(published, HashMap::from([(1, true)]));
+    }
+
+    #[test]
+    fn poisoned_shared_writes_recover_the_inner_state() {
+        let shared = Arc::new(RwLock::new(0));
+        let poisoned = Arc::clone(&shared);
+        assert!(
+            thread::spawn(move || {
+                let _guard = poisoned.write().unwrap();
+                panic!("poison test lock");
+            })
+            .join()
+            .is_err()
+        );
+
+        *write_unpoisoned(&shared) = 1;
+
+        assert_eq!(*shared.read().unwrap(), 1);
+    }
+
+    #[test]
+    fn runtime_config_poison_recovers_the_valid_snapshot_and_allows_reload() {
+        let config = shared_config(7, VictoryCondition::OneBoss(10));
+        let mut configured = configured_victory(&config);
+        let mut victory = VictoryTracker::new(configured.condition.clone(), []);
+        let poisoned = Arc::clone(&config);
+        assert!(
+            thread::spawn(move || {
+                let _guard = poisoned.write().unwrap();
+                panic!("poison test config");
+            })
+            .join()
+            .is_err()
+        );
+
+        let recovered = configured_victory(&config);
+        assert_eq!(recovered.revision, 7);
+        assert_eq!(recovered.condition, VictoryCondition::OneBoss(10));
+        assert!(config.write().is_ok());
+
+        *config.write().unwrap() = ConfigSnapshot {
+            revision: 8,
+            config: Some(runtime_with_victory(VictoryCondition::OneBoss(20))),
+        };
+        let latest = configured_victory(&config);
+        assert!(reconfigure_victory(&mut configured, latest, &mut victory,));
+        assert_eq!(victory.condition(), &VictoryCondition::OneBoss(20));
+    }
+
+    #[test]
+    fn monitor_initialization_recovers_a_poisoned_valid_victory_snapshot() {
+        let config = shared_config(7, VictoryCondition::OneBoss(10));
+        let poisoned = Arc::clone(&config);
+        assert!(
+            thread::spawn(move || {
+                let _guard = poisoned.write().unwrap();
+                panic!("poison test initial config");
+            })
+            .join()
+            .is_err()
+        );
+
+        let configured = configured_victory(&config);
+
+        assert_eq!(configured.revision, 7);
+        assert_eq!(configured.condition, VictoryCondition::OneBoss(10));
+        assert!(config.read().is_ok());
+    }
+
+    #[test]
+    fn hot_reload_between_sampling_and_observation_discards_the_stale_sample() {
+        let config = shared_config(0, VictoryCondition::OneBoss(10));
+        let mut configured = configured_victory(&config);
+        let mut victory = VictoryTracker::new(configured.condition.clone(), []);
+
+        *config.write().unwrap() = ConfigSnapshot {
+            revision: 1,
+            config: Some(runtime_with_victory(VictoryCondition::OneBoss(20))),
+        };
+
+        let latest = match observe_if_current(
+            &config,
+            configured.revision,
+            None,
+            &mut victory,
+            &HashMap::from([(10, true)]),
+            &[],
+        ) {
+            SampleObservation::Stale(latest) => latest,
+            other => panic!("expected a stale sample, got {other:?}"),
+        };
+        assert!(!victory.is_complete());
+        assert!(reconfigure_victory(&mut configured, latest, &mut victory,));
+        assert_eq!(victory.requested_flag_ids().collect::<Vec<_>>(), [20]);
+    }
+
+    #[test]
+    fn same_condition_revision_updates_without_rebuilding_victory() {
+        let mut configured = ConfiguredVictory {
+            revision: 1,
+            condition: VictoryCondition::OneBoss(10),
+        };
+        let mut victory = VictoryTracker::new(configured.condition.clone(), []);
+
+        assert!(!reconfigure_victory(
+            &mut configured,
+            ConfiguredVictory {
+                revision: 2,
+                condition: VictoryCondition::OneBoss(10),
+            },
+            &mut victory,
+        ));
+        assert_eq!(configured.revision, 2);
+        assert_eq!(victory.condition(), &VictoryCondition::OneBoss(10));
+    }
+
+    #[test]
+    fn post_completion_revision_updates_without_rebuilding_victory() {
+        let mut configured = ConfiguredVictory {
+            revision: 1,
+            condition: VictoryCondition::OneBoss(10),
+        };
+        let mut victory = VictoryTracker::new(configured.condition.clone(), []);
+        assert!(victory.observe(&HashMap::from([(10, true)]), &[]));
+
+        assert!(!reconfigure_victory(
+            &mut configured,
+            ConfiguredVictory {
+                revision: 2,
+                condition: VictoryCondition::OneBoss(20),
+            },
+            &mut victory,
+        ));
+        assert_eq!(configured.revision, 2);
+        assert_eq!(configured.condition, VictoryCondition::OneBoss(20));
+        assert_eq!(victory.condition(), &VictoryCondition::OneBoss(10));
+        assert!(victory.is_complete());
+    }
+
+    #[test]
+    fn victory_waits_for_current_game_time_before_completing() {
+        let config = shared_config(0, VictoryCondition::OneBoss(10));
+        let configured = configured_victory(&config);
+        let mut victory = VictoryTracker::new(configured.condition, []);
+        let active_target = HashMap::from([(10, true)]);
+
+        assert_eq!(
+            observe_if_current(
+                &config,
+                configured.revision,
+                None,
+                &mut victory,
+                &active_target,
+                &[],
+            ),
+            SampleObservation::Current(false)
+        );
+        assert!(!victory.is_complete());
+
+        assert_eq!(
+            observe_if_current(
+                &config,
+                configured.revision,
+                Some(456),
+                &mut victory,
+                &active_target,
+                &[],
+            ),
+            SampleObservation::Current(true)
+        );
+        assert!(victory.is_complete());
+    }
+
+    #[test]
+    fn completion_cycle_publishes_current_igt_before_goal_state() {
+        let state = create_state();
+        let igt = Arc::new(RwLock::new(100));
+        let state_guard = state.write().unwrap();
+        let worker_state = Arc::clone(&state);
+        let worker_igt = Arc::clone(&igt);
+        let worker = thread::spawn(move || {
+            publish_state_after_igt(
+                &worker_state,
+                &worker_igt,
+                Some(456),
+                MonitorStateUpdate {
+                    event_flags: None,
+                    key_item_quantity: 0,
+                    death_count: 0,
+                    great_runes: 0,
+                    goal_complete: true,
+                },
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while *igt.read().unwrap() != 456 {
+            assert!(
+                Instant::now() < deadline,
+                "IGT was not published while goal-state publication was blocked"
+            );
+            thread::yield_now();
+        }
+        assert!(!state_guard.goal_complete);
+        drop(state_guard);
+
+        worker.join().unwrap();
+        assert!(state.read().unwrap().goal_complete);
+        assert_eq!(*igt.read().unwrap(), 456);
+    }
+
+    #[test]
+    fn monitor_initialization_recovers_default_valued_poisoned_snapshots() {
+        let state = create_state();
+        let poisoned_state = Arc::clone(&state);
+        assert!(
+            thread::spawn(move || {
+                let _guard = poisoned_state.write().unwrap();
+                panic!("poison test state");
+            })
+            .join()
+            .is_err()
+        );
+        let igt = Arc::new(RwLock::new(0));
+        let poisoned_igt = Arc::clone(&igt);
+        assert!(
+            thread::spawn(move || {
+                let _guard = poisoned_igt.write().unwrap();
+                panic!("poison test IGT");
+            })
+            .join()
+            .is_err()
+        );
+
+        let (flags, quantity, deaths, runes, goal_complete) = initial_state_snapshot(&state);
+        let published_igt = initial_published_igt(&igt);
+
+        assert!(flags.is_empty());
+        assert_eq!((quantity, deaths, runes, goal_complete), (0, 0, 0, false));
+        assert_eq!(published_igt, 0);
+        assert!(state.read().is_ok());
+        assert!(igt.read().is_ok());
     }
 }

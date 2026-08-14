@@ -10,7 +10,10 @@ use crate::{
     util::text_formatter::format_display_text,
 };
 
+const GOAL_COMPLETE_TITLE: &str = "GOAL COMPLETE";
+
 pub struct OverlayViewModel {
+    pub title: Option<&'static str>,
     pub lines: Vec<String>,
 }
 
@@ -48,7 +51,11 @@ impl OverlayViewModel {
             ("shards", shards.to_string()),
             ("runes", runes.to_string()),
         ]);
+        let title = state
+            .is_some_and(|state| state.goal_complete)
+            .then_some(GOAL_COMPLETE_TITLE);
         Self {
+            title,
             lines: format_display_text(template.unwrap_or(DEFAULT_DISPLAY_TEXT), &variables),
         }
     }
@@ -109,7 +116,6 @@ mod tests {
             mode,
             prep_minutes,
             timer_minutes,
-            freeze_on_boss_flag: None,
         };
         assert_eq!(
             format_timer(60_000, timer(TimerMode::Regular, 0, 0)),
@@ -161,5 +167,29 @@ mod tests {
         );
 
         assert_eq!(model.lines, [" 1/2 runes=7 "]);
+    }
+
+    #[test]
+    fn exposes_goal_title_only_after_completion() {
+        let incomplete = OverlayViewModel::build(
+            Some(&AppState::default()),
+            0,
+            TimerSettings::default(),
+            Some("IGT: {igt}"),
+        );
+        assert_eq!(incomplete.title, None);
+
+        let complete = AppState {
+            goal_complete: true,
+            ..Default::default()
+        };
+        let complete = OverlayViewModel::build(
+            Some(&complete),
+            0,
+            TimerSettings::default(),
+            Some("IGT: {igt}"),
+        );
+        assert_eq!(complete.title, Some("GOAL COMPLETE"));
+        assert_eq!(complete.lines, [" IGT: 00:00:00 "]);
     }
 }

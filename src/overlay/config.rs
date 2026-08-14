@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use crate::overlay::style::{IgniteConfig, TimerMode};
+use crate::overlay::style::{IgniteConfig, TimerMode, VictoryConfig, VictoryMode};
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -15,6 +15,7 @@ pub struct RuntimeConfig {
     pub boss: BossConfig,
     pub overlay: OverlayConfig,
     pub timer: TimerSettings,
+    pub victory: VictoryCondition,
 }
 
 #[derive(Clone, Debug)]
@@ -73,7 +74,15 @@ pub struct TimerSettings {
     pub mode: TimerMode,
     pub prep_minutes: u32,
     pub timer_minutes: u32,
-    pub freeze_on_boss_flag: Option<i32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum VictoryCondition {
+    Checklist,
+    BossIds(Vec<i32>),
+    OneBoss(i32),
+    #[default]
+    None,
 }
 
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -152,18 +161,22 @@ fn load_config(path: &Path) -> Result<RuntimeConfig, String> {
         .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
     let file: IgniteConfig = toml::from_str(&contents)
         .map_err(|error| format!("Failed to parse {}: {error}", path.display()))?;
-    Ok(RuntimeConfig::from(file))
+    RuntimeConfig::try_from(file)
+        .map_err(|error| format!("Failed to validate {}: {error}", path.display()))
 }
 
-impl From<IgniteConfig> for RuntimeConfig {
-    fn from(file: IgniteConfig) -> Self {
+impl TryFrom<IgniteConfig> for RuntimeConfig {
+    type Error = String;
+
+    fn try_from(file: IgniteConfig) -> Result<Self, Self::Error> {
         let common = file.common.unwrap_or_default();
         let input = file.input.unwrap_or_default();
         let style = file.style.unwrap_or_default();
         let boss = file.boss.unwrap_or_default();
         let overlay = file.overlay.unwrap_or_default();
         let timer = file.timer;
-        Self {
+        let victory = validate_victory(file.victory.unwrap_or_default())?;
+        Ok(Self {
             common: CommonConfig {
                 console: common.console.unwrap_or(false),
                 font: common.font.filter(|font| !font.trim().is_empty()),
@@ -220,9 +233,36 @@ impl From<IgniteConfig> for RuntimeConfig {
                     .as_ref()
                     .and_then(|timer| timer.timer_minutes)
                     .unwrap_or(0),
-                freeze_on_boss_flag: timer.and_then(|timer| timer.freeze_on_boss_flag),
             },
+            victory,
+        })
+    }
+}
+
+fn validate_flag_id(flag_id: i32) -> Result<i32, String> {
+    (flag_id >= 0)
+        .then_some(flag_id)
+        .ok_or_else(|| format!("Victory event flag ID must be non-negative, got {flag_id}"))
+}
+
+fn validate_victory(config: VictoryConfig) -> Result<VictoryCondition, String> {
+    match (config.mode, config.boss_ids, config.boss_id) {
+        (VictoryMode::Checklist, None, None) => Ok(VictoryCondition::Checklist),
+        (VictoryMode::BossIds, Some(mut ids), None) if !ids.is_empty() => {
+            for id in &mut ids {
+                *id = validate_flag_id(*id)?;
+            }
+            ids.sort_unstable();
+            ids.dedup();
+            Ok(VictoryCondition::BossIds(ids))
         }
+        (VictoryMode::OneBoss, None, Some(id)) => {
+            Ok(VictoryCondition::OneBoss(validate_flag_id(id)?))
+        }
+        (VictoryMode::None, None, None) => Ok(VictoryCondition::None),
+        (mode, _, _) => Err(format!(
+            "Victory mode {mode:?} has missing or contradictory boss ID fields"
+        )),
     }
 }
 
@@ -240,60 +280,57 @@ fn modified_time(path: &Path) -> Option<SystemTime> {
 
 #[cfg(test)]
 mod tests {
-    use super::RuntimeConfig;
-    use crate::overlay::style::{IgniteConfig, TimerMode};
+    use super::{RuntimeConfig, VictoryCondition};
+    use crate::overlay::style::IgniteConfig;
 
-    #[test]
-    fn preserves_legacy_timer_and_overlay_settings() {
-        let source = r#"
-            [common]
-            font_size = 42
-
-            [timer]
-            mode = "PrepTimer"
-            prep_minutes = 5
-            timer_minutes = 90
-            freeze_on_boss_flag = 123456
-
-            [overlay]
-            display_text = "IGT: {igt}"
-        "#;
-        let file: IgniteConfig = toml::from_str(source).unwrap();
-        let config = RuntimeConfig::from(file);
-
-        assert_eq!(config.common.font_size, 42.0);
-        assert_eq!(config.timer.mode, TimerMode::PrepTimer);
-        assert_eq!(config.timer.prep_minutes, 5);
-        assert_eq!(config.timer.timer_minutes, 90);
-        assert_eq!(config.timer.freeze_on_boss_flag, Some(123456));
-        assert_eq!(config.overlay.display_text, "IGT: {igt}");
+    fn parse_runtime(source: &str) -> Result<RuntimeConfig, String> {
+        let file: IgniteConfig = toml::from_str(source).map_err(|error| error.to_string())?;
+        RuntimeConfig::try_from(file)
     }
 
     #[test]
-    fn fills_defaults_for_existing_minimal_configs() {
-        let file: IgniteConfig = toml::from_str("").unwrap();
-        let config = RuntimeConfig::from(file);
-
-        assert_eq!(config.timer.mode, TimerMode::Regular);
-        assert_eq!(config.timer.freeze_on_boss_flag, None);
-        assert_eq!(config.common.font_scale, 1.0);
-        assert_eq!(config.boss.data_file, "bosses.json");
+    fn parses_all_victory_modes_and_defaults_to_none() {
+        assert_eq!(parse_runtime("").unwrap().victory, VictoryCondition::None);
+        assert_eq!(
+            parse_runtime("[victory]\nmode = \"Checklist\"")
+                .unwrap()
+                .victory,
+            VictoryCondition::Checklist
+        );
+        assert_eq!(
+            parse_runtime("[victory]\nmode = \"BossIds\"\nboss_ids = [20, 10, 20]")
+                .unwrap()
+                .victory,
+            VictoryCondition::BossIds(vec![10, 20])
+        );
+        assert_eq!(
+            parse_runtime("[victory]\nmode = \"OneBoss\"\nboss_id = 19000800")
+                .unwrap()
+                .victory,
+            VictoryCondition::OneBoss(19000800)
+        );
+        assert_eq!(
+            parse_runtime("[victory]\nmode = \"None\"").unwrap().victory,
+            VictoryCondition::None
+        );
     }
 
     #[test]
-    fn timer_section_can_only_set_a_freeze_flag() {
-        let file: IgniteConfig = toml::from_str(
-            r#"
-                [timer]
-                freeze_on_boss_flag = 123456
-            "#,
-        )
-        .unwrap();
-        let config = RuntimeConfig::from(file);
+    fn rejects_incomplete_contradictory_and_negative_victory_settings() {
+        for source in [
+            "[victory]\nmode = \"BossIds\"\nboss_ids = []",
+            "[victory]\nmode = \"BossIds\"\nboss_ids = [1]\nboss_id = 2",
+            "[victory]\nmode = \"OneBoss\"",
+            "[victory]\nmode = \"OneBoss\"\nboss_id = -1",
+            "[victory]\nmode = \"Checklist\"\nboss_id = 1",
+            "[victory]\nmode = \"None\"\nboss_ids = [1]",
+        ] {
+            assert!(parse_runtime(source).is_err(), "accepted {source}");
+        }
+    }
 
-        assert_eq!(config.timer.mode, TimerMode::Regular);
-        assert_eq!(config.timer.prep_minutes, 0);
-        assert_eq!(config.timer.timer_minutes, 0);
-        assert_eq!(config.timer.freeze_on_boss_flag, Some(123456));
+    #[test]
+    fn rejects_removed_freeze_on_boss_flag_setting() {
+        assert!(parse_runtime("[timer]\nfreeze_on_boss_flag = 19000800").is_err());
     }
 }

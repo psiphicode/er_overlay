@@ -75,12 +75,30 @@ pub enum TimerMode {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimerConfig {
     #[serde(default)]
     pub mode: TimerMode,
     pub prep_minutes: Option<u32>,
     pub timer_minutes: Option<u32>,
-    pub freeze_on_boss_flag: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub enum VictoryMode {
+    Checklist,
+    BossIds,
+    OneBoss,
+    #[default]
+    None,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct VictoryConfig {
+    #[serde(default)]
+    pub mode: VictoryMode,
+    pub boss_ids: Option<Vec<i32>>,
+    pub boss_id: Option<i32>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -91,6 +109,7 @@ pub struct IgniteConfig {
     pub boss: Option<Boss>,
     pub overlay: Option<Overlay>,
     pub timer: Option<TimerConfig>,
+    pub victory: Option<VictoryConfig>,
 }
 
 pub fn apply_style_config(imgui: &mut Context, cfg: &RuntimeConfig) {

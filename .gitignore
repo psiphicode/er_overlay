@@ -2,3 +2,7 @@
 .*
 smithbox
 docs
+/output
+/build-release-test
+/er-overlay-*-windows-x86_64.zip
+/*.er-overlay-release-owner

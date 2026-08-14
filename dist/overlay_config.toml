@@ -81,9 +81,17 @@ mode="Regular"
 prep_minutes=2
 timer_minutes=0
 
-# Optional event flag ID. Once this flag is observed active, the displayed IGT
-# stops updating. Changing or removing this setting resumes the timer until the
-# newly configured flag activates.
-# Radagon & Elden Beast: 19000800
-# Prime Consort Radahn: 20010800
-freeze_on_boss_flag=19000800
+[victory]
+# None: victory tracking is disabled.
+# Checklist: complete after every boss in the selected [boss].data_file.
+# BossIds: complete after every ID in boss_ids, whether or not listed in the checklist.
+# OneBoss: complete after boss_id, whether or not listed in the checklist.
+mode="None"
+
+# BossIds example:
+# mode="BossIds"
+# boss_ids=[10000800,19000800]
+
+# OneBoss example, Radagon and Elden Beast:
+# mode="OneBoss"
+# boss_id=19000800

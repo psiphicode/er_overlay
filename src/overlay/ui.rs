@@ -15,7 +15,7 @@ use crate::{
         input::InputController,
         layout::{
             OverlayLayout, header_clicked, normalize_swap_chain_framebuffer_scale,
-            render_centered_text,
+            render_centered_line, render_centered_text,
         },
         runtime::OverlayRuntime,
         style::{apply_common_config, apply_runtime_font_scale, apply_style_config},
@@ -97,8 +97,9 @@ impl EROverlayUi {
     }
 
     fn render_closed(&mut self, ui: &Ui, model: &OverlayViewModel) {
-        render_centered_text(ui, &model.lines);
-        let total_h = ui.text_line_height_with_spacing() * model.lines.len() as f32 + 8.0;
+        render_centered_text(ui, model.title, &model.lines);
+        let line_count = model.lines.len() + usize::from(model.title.is_some());
+        let total_h = ui.text_line_height_with_spacing() * line_count as f32 + 8.0;
 
         if header_clicked(ui, total_h) {
             let now = Instant::now();
@@ -111,11 +112,15 @@ impl EROverlayUi {
     }
 
     fn render_open(&mut self, ui: &Ui, model: &OverlayViewModel) {
+        if let Some(title) = model.title {
+            render_centered_line(ui, title);
+        }
         for line in &model.lines {
             ui.text(line);
         }
 
-        let header_h = ui.text_line_height_with_spacing() * model.lines.len() as f32 + 8.0;
+        let line_count = model.lines.len() + usize::from(model.title.is_some());
+        let header_h = ui.text_line_height_with_spacing() * line_count as f32 + 8.0;
         if header_clicked(ui, header_h) {
             let now = Instant::now();
             if now.duration_since(self.last_toggle_time) > Duration::from_millis(300) {
@@ -145,12 +150,14 @@ impl EROverlayUi {
     ) -> (f32, f32) {
         let pad = unsafe { ui.style().window_padding };
         let max_w = model
-            .lines
-            .iter()
+            .title
+            .into_iter()
+            .chain(model.lines.iter().map(String::as_str))
             .map(|line| ui.calc_text_size(line)[0])
             .fold(0.0, f32::max);
 
-        let total_h = pad[1] * 2.0 + ui.text_line_height_with_spacing() * model.lines.len() as f32;
+        let line_count = model.lines.len() + usize::from(model.title.is_some());
+        let total_h = pad[1] * 2.0 + ui.text_line_height_with_spacing() * line_count as f32;
         let measured_width = (pad[0] * 2.0 + max_w).ceil() + 4.0;
         let total_w = fixed_width.map(f32::ceil).unwrap_or(measured_width);
 
