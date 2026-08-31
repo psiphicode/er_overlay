@@ -16,6 +16,11 @@ $ancestorTargetPath = Join-Path $testRoot 'ancestor-target'
 $ancestorLinkPath = Join-Path $testRoot 'ancestor-link'
 $ancestorOutputPath = Join-Path $ancestorLinkPath 'nested-output'
 $archiveFileLinkTargetPath = Join-Path $testRoot 'archive-link-target.zip'
+$configuredFlagsOutputPath = Join-Path $testRoot 'configured-flags-output'
+$spacedProfileOutputPath = Join-Path $testRoot 'spaced-profile-output'
+$wrapperProbeSourcePath = Join-Path $testRoot 'rustc-wrapper-probe.rs'
+$wrapperProbePath = Join-Path $testRoot 'rustc-wrapper-probe.exe'
+$wrapperProbeMarkerPath = Join-Path $testRoot 'rustc-wrapper-probe.marker'
 $ownsTestRoot = $false
 $ownsReparseOutput = $false
 $ownsReparseArchive = $false
@@ -130,6 +135,222 @@ function Assert-PackagedLayout {
         -Actual @($packageInventory.Directories)
 }
 
+function Assert-NoUserProfilePathInBinary {
+    param(
+        [string]$Path,
+        [string]$UserProfile
+    )
+
+    if ([string]::IsNullOrWhiteSpace($UserProfile)) {
+        $UserProfile = $env:USERPROFILE
+    }
+    if ([string]::IsNullOrWhiteSpace($UserProfile)) {
+        $UserProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+    }
+    if ([string]::IsNullOrWhiteSpace($UserProfile)) {
+        throw 'Could not resolve the user profile path for release privacy validation'
+    }
+
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $utf8Text = [Text.Encoding]::UTF8.GetString($bytes)
+    $utf16EvenText = [Text.Encoding]::Unicode.GetString($bytes)
+    $utf16OddText = if ($bytes.Length -gt 1) {
+        [Text.Encoding]::Unicode.GetString($bytes, 1, $bytes.Length - 1)
+    } else {
+        ''
+    }
+    $profileVariants = @($UserProfile, $UserProfile.Replace('\', '/'))
+    foreach ($profileVariant in $profileVariants) {
+        if ($utf8Text.IndexOf($profileVariant, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            $utf16EvenText.IndexOf($profileVariant, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            $utf16OddText.IndexOf($profileVariant, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            throw "Packaged binary contains the local user profile path: $Path"
+        }
+    }
+}
+
+function Assert-ProfilePathFixtureRejected {
+    param(
+        [string]$Path,
+        [byte[]]$Bytes,
+        [string]$Label,
+        [string]$UserProfile
+    )
+
+    [IO.File]::WriteAllBytes($Path, $Bytes)
+    $rejected = $false
+    try {
+        Assert-NoUserProfilePathInBinary -Path $Path -UserProfile $UserProfile
+    } catch {
+        $rejected = $true
+        if (-not $_.Exception.Message.StartsWith(
+            'Packaged binary contains the local user profile path:',
+            [StringComparison]::Ordinal
+        )) {
+            throw "Unexpected $Label fixture failure: $($_.Exception.Message)"
+        }
+    }
+    if (-not $rejected) {
+        throw "$Label profile-path fixture was not rejected"
+    }
+}
+
+function Get-ProcessEnvironmentSnapshot {
+    param([string[]]$Names)
+
+    $snapshot = @{}
+    foreach ($name in $Names) {
+        $snapshot[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    }
+    return $snapshot
+}
+
+function Assert-ProcessEnvironmentSnapshot {
+    param(
+        [hashtable]$Expected,
+        [string]$Label
+    )
+
+    foreach ($name in $Expected.Keys) {
+        $actual = [Environment]::GetEnvironmentVariable($name, 'Process')
+        if (-not [string]::Equals($actual, $Expected[$name], [StringComparison]::Ordinal)) {
+            throw "$Label did not restore process environment variable $name"
+        }
+    }
+}
+
+function Assert-ConfiguredTargetRustFlagsPreserved {
+    param([string]$Path)
+
+    $variableName = 'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS'
+    $environmentNames = @(
+        'CARGO_ENCODED_RUSTFLAGS',
+        'CFLAGS',
+        'CXXFLAGS',
+        'RUSTC_WRAPPER',
+        '_CL_',
+        'ER_OVERLAY_RELEASE_REMAP_BACKSLASH',
+        'ER_OVERLAY_RELEASE_REMAP_FORWARD',
+        'ER_OVERLAY_RELEASE_INNER_RUSTC_WRAPPER'
+    )
+    $savedTargetFlags = [Environment]::GetEnvironmentVariable($variableName, 'Process')
+    [Environment]::SetEnvironmentVariable(
+        $variableName,
+        '--er-overlay-invalid-configured-target-flag',
+        'Process'
+    )
+    $environmentSnapshot = Get-ProcessEnvironmentSnapshot -Names $environmentNames
+    try {
+        $failed = $false
+        try {
+            & (Join-Path $PSScriptRoot 'build-release.ps1') -OutputPath $Path
+        } catch {
+            $failed = $true
+            if (-not $_.Exception.Message.StartsWith('Cargo build failed with exit code', [StringComparison]::Ordinal)) {
+                throw "Unexpected configured-target-rustflags failure: $($_.Exception.Message)"
+            }
+        }
+        if (-not $failed) {
+            throw 'Release build discarded configured target rustflags'
+        }
+        Assert-ProcessEnvironmentSnapshot -Expected $environmentSnapshot -Label 'Failed release build'
+    } finally {
+        [Environment]::SetEnvironmentVariable($variableName, $savedTargetFlags, 'Process')
+    }
+}
+
+function Assert-ExistingRustcWrapperNested {
+    param([string]$Path)
+
+    $probeSource = @'
+use std::env;
+use std::fs;
+use std::process::{self, Command};
+
+fn main() {
+    let mut arguments = env::args_os();
+    let _wrapper = arguments.next();
+    let rustc = arguments.next().expect("probe wrapper did not receive rustc");
+    let marker = env::var_os("ER_OVERLAY_TEST_WRAPPER_MARKER")
+        .expect("probe wrapper marker is missing");
+    fs::write(marker, b"invoked").expect("probe wrapper could not write marker");
+    let status = Command::new(rustc)
+        .args(arguments)
+        .status()
+        .expect("probe wrapper could not start rustc");
+    process::exit(status.code().unwrap_or(1));
+}
+'@
+    [IO.File]::WriteAllText($wrapperProbeSourcePath, $probeSource, $utf8WithoutBom)
+    & rustc --edition=2021 -O $wrapperProbeSourcePath -o $wrapperProbePath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Test rustc wrapper build failed with exit code $LASTEXITCODE"
+    }
+
+    $savedRustcWrapper = $env:RUSTC_WRAPPER
+    $savedMarker = $env:ER_OVERLAY_TEST_WRAPPER_MARKER
+    try {
+        $env:RUSTC_WRAPPER = $wrapperProbePath
+        $env:ER_OVERLAY_TEST_WRAPPER_MARKER = $wrapperProbeMarkerPath
+        Assert-ConfiguredTargetRustFlagsPreserved -Path $Path
+        if (-not (Test-Path -LiteralPath $wrapperProbeMarkerPath -PathType Leaf)) {
+            throw 'Release build did not invoke the existing rustc wrapper'
+        }
+        if (-not [string]::Equals($env:RUSTC_WRAPPER, $wrapperProbePath, [StringComparison]::Ordinal)) {
+            throw 'Failed release build did not restore the existing rustc wrapper'
+        }
+    } finally {
+        $env:RUSTC_WRAPPER = $savedRustcWrapper
+        $env:ER_OVERLAY_TEST_WRAPPER_MARKER = $savedMarker
+    }
+}
+
+function Assert-SpacedUserProfileBuild {
+    param(
+        [string]$Path,
+        [string]$ActualUserProfile
+    )
+
+    $environmentNames = @(
+        'USERPROFILE',
+        'CARGO_HOME',
+        'RUSTUP_HOME',
+        'RUSTUP_TOOLCHAIN',
+        'CARGO_ENCODED_RUSTFLAGS',
+        'CXXFLAGS',
+        '_CL_'
+    )
+    $environmentSnapshot = Get-ProcessEnvironmentSnapshot -Names $environmentNames
+    $separator = [char]0x1f
+    $actualProfileForward = $ActualUserProfile.Replace('\', '/')
+    try {
+        $env:USERPROFILE = Join-Path $testRoot 'Profile With Spaces'
+        $env:CARGO_HOME = Join-Path $ActualUserProfile '.cargo'
+        $env:RUSTUP_HOME = Join-Path $ActualUserProfile '.rustup'
+        $env:RUSTUP_TOOLCHAIN = 'stable-x86_64-pc-windows-msvc'
+        $env:CARGO_ENCODED_RUSTFLAGS = @(
+            "--remap-path-prefix=$ActualUserProfile=/redacted/user",
+            "--remap-path-prefix=$actualProfileForward=/redacted/user"
+        ) -join $separator
+        $env:CXXFLAGS = (@($environmentSnapshot.CXXFLAGS, '/DER_OVERLAY_SPACED_PROFILE_TEST=1') | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_)
+        }) -join ' '
+        $actualNativeTrimFlag = "/d1trimfile:`"$ActualUserProfile`""
+        $env:_CL_ = (@($environmentSnapshot.'_CL_', $actualNativeTrimFlag) | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_)
+        }) -join ' '
+
+        & (Join-Path $PSScriptRoot 'build-release.ps1') -OutputPath $Path
+        Assert-PackagedLayout -Path $Path
+        Assert-NoUserProfilePathInBinary -Path (Join-Path $Path 'er_overlay.dll') `
+            -UserProfile $ActualUserProfile
+    } finally {
+        foreach ($name in $environmentSnapshot.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $environmentSnapshot[$name], 'Process')
+        }
+    }
+}
+
 function Assert-ArchiveLayout {
     param([string]$Path)
 
@@ -192,6 +413,17 @@ try {
     }
     New-Item -ItemType Directory -Path $testRoot | Out-Null
     $ownsTestRoot = $true
+
+    $fixtureProfile = 'C:\Users\Release Fixture'
+    $fixtureUtf8 = [Text.Encoding]::UTF8.GetBytes("prefix$fixtureProfile suffix")
+    $fixtureUtf16 = [Text.Encoding]::Unicode.GetBytes("prefix$fixtureProfile suffix")
+    $fixtureOddUtf16 = [byte[]](@(0x2a) + [Text.Encoding]::Unicode.GetBytes($fixtureProfile) + @(0x00))
+    Assert-ProfilePathFixtureRejected -Path (Join-Path $testRoot 'profile-utf8.bin') `
+        -Bytes $fixtureUtf8 -Label 'UTF-8' -UserProfile $fixtureProfile
+    Assert-ProfilePathFixtureRejected -Path (Join-Path $testRoot 'profile-utf16.bin') `
+        -Bytes $fixtureUtf16 -Label 'even-aligned UTF-16LE' -UserProfile $fixtureProfile
+    Assert-ProfilePathFixtureRejected -Path (Join-Path $testRoot 'profile-odd-utf16.bin') `
+        -Bytes $fixtureOddUtf16 -Label 'odd-aligned UTF-16LE' -UserProfile $fixtureProfile
 
     $shortRepoRoot = Get-ShortPath -Path $repoRoot
     if (-not $shortRepoRoot.Equals($repoRoot, [StringComparison]::OrdinalIgnoreCase)) {
@@ -320,8 +552,28 @@ try {
         }
     }
 
+    $releaseEnvironmentNames = @(
+        'CFLAGS',
+        'CXXFLAGS',
+        'RUSTC_WRAPPER',
+        '_CL_',
+        'ER_OVERLAY_RELEASE_REMAP_BACKSLASH',
+        'ER_OVERLAY_RELEASE_REMAP_FORWARD',
+        'ER_OVERLAY_RELEASE_INNER_RUSTC_WRAPPER'
+    )
+    $releaseEnvironmentSnapshot = Get-ProcessEnvironmentSnapshot -Names $releaseEnvironmentNames
     & (Join-Path $PSScriptRoot 'build-release.ps1') -OutputPath $outputPath
+    Assert-ProcessEnvironmentSnapshot -Expected $releaseEnvironmentSnapshot `
+        -Label 'Successful release build'
     Assert-PackagedLayout -Path $outputPath
+    Assert-NoUserProfilePathInBinary -Path (Join-Path $outputPath 'er_overlay.dll')
+    Assert-ExistingRustcWrapperNested -Path $configuredFlagsOutputPath
+    $actualUserProfile = $env:USERPROFILE
+    if ([string]::IsNullOrWhiteSpace($actualUserProfile)) {
+        $actualUserProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+    }
+    Assert-SpacedUserProfileBuild -Path $spacedProfileOutputPath `
+        -ActualUserProfile $actualUserProfile
     $markerPath = "$outputPath$markerSuffix"
     $expectedMarker = "$markerMagic`r`n$markerVersion`r`noutput=$([IO.Path]::GetFullPath($outputPath))"
     if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {

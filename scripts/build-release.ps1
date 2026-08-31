@@ -330,6 +330,37 @@ function Get-WorkspaceRootPackageVersion {
     return $version
 }
 
+function Get-ReleaseUserProfilePath {
+    $userProfile = $env:USERPROFILE
+    if ([string]::IsNullOrWhiteSpace($userProfile)) {
+        $userProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+    }
+    if ([string]::IsNullOrWhiteSpace($userProfile)) {
+        throw 'Could not resolve the user profile path for release source-path remapping'
+    }
+    return $userProfile
+}
+
+function Get-ReleaseBuildKey {
+    param(
+        [string]$BuildScriptPath,
+        [string]$WrapperSourcePath,
+        [string]$UserProfile
+    )
+
+    $scriptHash = (Get-FileHash -LiteralPath $BuildScriptPath -Algorithm SHA256).Hash
+    $wrapperHash = (Get-FileHash -LiteralPath $WrapperSourcePath -Algorithm SHA256).Hash
+    $keyBytes = [Text.Encoding]::UTF8.GetBytes("$scriptHash`n$wrapperHash`n$UserProfile")
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $keyHash = $sha256.ComputeHash($keyBytes)
+    } finally {
+        $sha256.Dispose()
+    }
+    $keyHex = ($keyHash | ForEach-Object { $_.ToString('x2') }) -join ''
+    return $keyHex.Substring(0, 16)
+}
+
 function Assert-ArchiveLayout {
     param([string]$Path)
 
@@ -405,16 +436,66 @@ if ($Zip) {
 }
 
 Push-Location $repoRoot
+$savedRustcWrapper = $env:RUSTC_WRAPPER
+$savedRemapBackslash = $env:ER_OVERLAY_RELEASE_REMAP_BACKSLASH
+$savedRemapForward = $env:ER_OVERLAY_RELEASE_REMAP_FORWARD
+$savedInnerRustcWrapper = $env:ER_OVERLAY_RELEASE_INNER_RUSTC_WRAPPER
+$savedTrailingClFlags = $env:_CL_
+$savedCFlags = $env:CFLAGS
+$savedCxxFlags = $env:CXXFLAGS
 try {
-    & cargo build --locked --release --target x86_64-pc-windows-msvc
+    $releaseUserProfile = Get-ReleaseUserProfilePath
+    $wrapperSource = Join-Path $PSScriptRoot 'release-rustc-wrapper.rs'
+    $releaseBuildKey = Get-ReleaseBuildKey -BuildScriptPath $PSCommandPath `
+        -WrapperSourcePath $wrapperSource `
+        -UserProfile $releaseUserProfile
+    $releaseTargetDir = Join-Path $repoRoot "target\release-package-$releaseBuildKey"
+    $wrapperDirectory = Join-Path $repoRoot 'target\release-tools'
+    $wrapperPath = Join-Path $wrapperDirectory "release-rustc-wrapper-$releaseBuildKey.exe"
+    if (-not (Test-Path -LiteralPath $wrapperDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $wrapperDirectory -Force | Out-Null
+    }
+    & rustc --edition=2021 -O $wrapperSource -o $wrapperPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Release rustc wrapper build failed with exit code $LASTEXITCODE"
+    }
+
+    $env:RUSTC_WRAPPER = $wrapperPath
+    $env:ER_OVERLAY_RELEASE_REMAP_BACKSLASH = $releaseUserProfile
+    $env:ER_OVERLAY_RELEASE_REMAP_FORWARD = $releaseUserProfile.Replace('\', '/')
+    $env:ER_OVERLAY_RELEASE_INNER_RUSTC_WRAPPER = $savedRustcWrapper
+
+    $nativePathTrimFlag = "/d1trimfile:`"$releaseUserProfile`""
+    $env:_CL_ = (@($savedTrailingClFlags, $nativePathTrimFlag) | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_)
+    }) -join ' '
+    if ($env:_CL_.Length -gt 1024) {
+        throw 'MSVC trailing compiler flags exceed the 1024-character _CL_ limit'
+    }
+    $nativeRebuildFlag = '/DER_OVERLAY_RELEASE_PATH_TRIM=1'
+    $env:CFLAGS = (@($savedCFlags, $nativeRebuildFlag) | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_)
+    }) -join ' '
+    $env:CXXFLAGS = (@($savedCxxFlags, $nativeRebuildFlag) | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_)
+    }) -join ' '
+    & cargo build --locked --release --target x86_64-pc-windows-msvc `
+        --target-dir $releaseTargetDir
     if ($LASTEXITCODE -ne 0) {
         throw "Cargo build failed with exit code $LASTEXITCODE"
     }
 } finally {
+    $env:RUSTC_WRAPPER = $savedRustcWrapper
+    $env:ER_OVERLAY_RELEASE_REMAP_BACKSLASH = $savedRemapBackslash
+    $env:ER_OVERLAY_RELEASE_REMAP_FORWARD = $savedRemapForward
+    $env:ER_OVERLAY_RELEASE_INNER_RUSTC_WRAPPER = $savedInnerRustcWrapper
+    $env:_CL_ = $savedTrailingClFlags
+    $env:CFLAGS = $savedCFlags
+    $env:CXXFLAGS = $savedCxxFlags
     Pop-Location
 }
 
-$dllPath = Join-Path $repoRoot 'target\x86_64-pc-windows-msvc\release\er_overlay.dll'
+$dllPath = Join-Path $releaseTargetDir 'x86_64-pc-windows-msvc\release\er_overlay.dll'
 $distPath = Join-Path $repoRoot 'dist'
 if (-not (Test-Path -LiteralPath $dllPath -PathType Leaf)) {
     throw "Built DLL was not found: $dllPath"
