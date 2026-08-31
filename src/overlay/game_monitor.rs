@@ -175,6 +175,15 @@ fn build_monitor_observation(
     }
 }
 
+fn deliver_monitor_observation(
+    sender: Option<&Sender<MonitorObservation>>,
+    observation: MonitorObservation,
+) {
+    if let Some(sender) = sender {
+        let _ = sender.send(observation);
+    }
+}
+
 struct MonitorStateUpdate {
     event_flags: Option<HashMap<i32, bool>>,
     key_item_quantity: u32,
@@ -276,7 +285,7 @@ pub fn start_game_monitor(
                                     &boss_flag_ids,
                                     SystemTime::now(),
                                 );
-                                let _ = sender.send(observation);
+                                deliver_monitor_observation(Some(sender), observation);
                             }
                             for (flag_id, value) in sample.values {
                                 if is_great_rune_flag(flag_id) {
@@ -394,10 +403,11 @@ mod tests {
     };
 
     use super::{
-        ConfiguredVictory, GREAT_RUNE_FLAGS, MonitorStateUpdate, SampleObservation,
-        build_monitor_observation, configured_victory, initial_published_igt,
-        initial_state_snapshot, merge_boss_flags, monitored_flag_ids, observe_if_current,
-        publish_state_after_igt, reconfigure_victory, write_unpoisoned,
+        ConfiguredVictory, GREAT_RUNE_FLAGS, MonitorObservation, MonitorStateUpdate,
+        SampleObservation, build_monitor_observation, configured_victory,
+        deliver_monitor_observation, initial_published_igt, initial_state_snapshot,
+        merge_boss_flags, monitored_flag_ids, observe_if_current, publish_state_after_igt,
+        reconfigure_victory, write_unpoisoned,
     };
 
     fn runtime_with_victory(victory: VictoryCondition) -> Arc<RuntimeConfig> {
@@ -426,6 +436,18 @@ mod tests {
 
         assert_eq!(observation.active_boss_flags, [20, 30]);
         assert_eq!(observation.observed_at, observed_at);
+    }
+
+    #[test]
+    fn disconnected_reporter_does_not_fail_monitor_delivery() {
+        let (sender, receiver) = crossbeam::channel::unbounded();
+        drop(receiver);
+        let observation = MonitorObservation {
+            active_boss_flags: vec![20, 30],
+            observed_at: SystemTime::UNIX_EPOCH,
+        };
+
+        deliver_monitor_observation(Some(&sender), observation);
     }
 
     fn shared_config(revision: u64, victory: VictoryCondition) -> SharedConfig {

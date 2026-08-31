@@ -11,6 +11,65 @@ This is an in-game overlay for ELDEN RING with the ability to track the followin
 
 ---
 
+## Automark reporting (optional)
+
+Automark builds are developed on the personal repository's
+[`automark` branch](https://github.com/psiphicode/er_overlay/tree/automark).
+Packaged builds are published on the personal
+[releases page](https://github.com/psiphicode/er_overlay/releases/latest).
+
+The overlay can report boss kills to an HTTP endpoint, so a tracker website can
+mark a boss when it dies without requiring a manual update.
+
+Reporting is off by default. Until both an endpoint and token are configured,
+the overlay makes no reporting requests. This is a generic webhook, not a
+client for a particular tracker. The tracker supplies the endpoint and token,
+and the shipped configuration points at nothing.
+
+To enable reporting, edit the `[ingest]` section of `overlay_config.toml`:
+
+```toml
+[ingest]
+url = "https://your-tracker.example/kills"
+token = "your-token"
+interval_ms = 1000
+heartbeat_s = 60
+```
+
+Clearing either `url` or `token`, or deleting the section, disables reporting.
+Each request contains the configured token and the IDs of boss flags observed
+as killed:
+
+```json
+{ "token": "...", "kills": [ { "flag": 1042360800, "at": "2026-08-13T19:04:12.140Z" } ] }
+```
+
+The webhook is intentionally product-neutral. The overlay has no knowledge of
+teams, boards, rooms, or how the receiving tracker uses a report.
+
+A few properties are worth knowing:
+
+- **Read-only.** The overlay reads event flags exactly as it already does for
+  the boss list. Reporting never writes event flags or other game memory.
+- **Self-healing.** Every report carries the full observed kill set. A dropped
+  request or restart recovers on a later report without double-counting.
+- **Failure-isolated.** A network or server failure does not stop monitoring or
+  affect the game. The overlay keeps the kill set for a later report.
+- Reloading a save or returning to the menu is never treated as reversing a
+  kill.
+- **Language-independent.** Reports contain flag IDs, never localized boss
+  names.
+
+When the server supplies a tally, Automark displays an additional status line:
+
+```text
+Hit 8   Miss 4   Total 12   Acc 67%
+```
+
+`[!]` on that line means the latest report failed. Expanded mode shows a short
+reason below the normal overlay lines. Set `show_ingest_tally = false` under
+`[overlay]` to hide both status messages.
+
 ## Victory conditions
 
 Victory tracking is disabled by default:

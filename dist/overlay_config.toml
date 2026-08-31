@@ -61,6 +61,8 @@ data_file="all_bosses.json"
 # Optional fixed compact-mode width in pixels. Remove this setting to size the
 # compact window from its current text content.
 # closed_width=320
+# Show server-reported Automark status in the overlay when reporting is enabled.
+show_ingest_tally = true
 # how to display the text on the overlay
 # display text = "IGT: {igt}$nBosses: {kills}/{total}$nGreat Runes: {runes}$nShards: {shards}$nDeaths: {deaths}"
 #  $n = newline
@@ -95,3 +97,11 @@ mode="None"
 # OneBoss example, Radagon and Elden Beast:
 # mode="OneBoss"
 # boss_id=19000800
+
+[ingest]
+# Reporting stays disabled until both values are supplied by a compatible
+# generic webhook service.
+url = ""
+token = ""
+interval_ms = 1000
+heartbeat_s = 60

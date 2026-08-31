@@ -25,6 +25,7 @@
 
 use std::{
     collections::{BTreeMap, btree_map::Entry},
+    fmt,
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -71,7 +72,7 @@ const ROUTINE_SKIPS: [&str; 3] = ["already_fired", "not_on_this_board", "not_a_s
 // ----------------------------------------------------
 //
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IngestSettings {
     pub url: String,
     pub token: String,
@@ -80,6 +81,18 @@ pub struct IngestSettings {
     pub interval: Duration,
     /// How often to resend the full kill set when nothing has changed.
     pub heartbeat: Duration,
+}
+
+impl fmt::Debug for IngestSettings {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IngestSettings")
+            .field("url", &"[redacted]")
+            .field("token", &"[redacted]")
+            .field("interval", &self.interval)
+            .field("heartbeat", &self.heartbeat)
+            .finish()
+    }
 }
 
 impl IngestSettings {
@@ -305,8 +318,7 @@ pub fn start_reporter(
     let (tx, rx) = unbounded();
 
     debug_log!(
-        "[automark] [ingest] reporting to {} (interval {}ms, heartbeat {}s)",
-        settings.url,
+        "[automark] [ingest] reporting enabled (interval {}ms, heartbeat {}s)",
         settings.interval.as_millis(),
         settings.heartbeat.as_secs()
     );
@@ -479,11 +491,13 @@ fn send_with_retry(
                 return;
             }
             Attempt::Rejected(error) => {
+                let error = redact_config_secrets(&error, settings);
                 debug_log!("[automark] [ingest] ❌ rejected: {error}");
                 set_warn(status, first_seen.len(), &error);
                 return;
             }
             Attempt::Retryable(error) => {
+                let error = redact_config_secrets(&error, settings);
                 if attempt == MAX_ATTEMPTS {
                     debug_log!(
                         "[automark] [ingest] ❌ giving up after {attempt} attempts: {error} \
@@ -503,6 +517,12 @@ fn send_with_retry(
             }
         }
     }
+}
+
+fn redact_config_secrets(error: &str, settings: &IngestSettings) -> String {
+    error
+        .replace(&settings.url, "[redacted endpoint]")
+        .replace(&settings.token, "[redacted token]")
 }
 
 fn build_body(
@@ -760,6 +780,66 @@ mod tests {
         .unwrap();
         assert_eq!(s.interval, Duration::from_millis(100));
         assert_eq!(s.heartbeat, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn settings_debug_redacts_endpoint_and_token() {
+        let endpoint = "https://private.example.test/report";
+        let token = "secret-player-token";
+        let settings = settings(endpoint, token).unwrap();
+
+        let debug = format!("{settings:?}");
+
+        assert!(!debug.contains(endpoint));
+        assert!(!debug.contains(token));
+    }
+
+    #[test]
+    fn configured_secrets_are_removed_from_reporter_errors() {
+        let endpoint = "https://private.example.test/report";
+        let token = "secret-player-token";
+        let settings = settings(endpoint, token).unwrap();
+
+        let safe = redact_config_secrets(
+            &format!("request to {endpoint} included {token}"),
+            &settings,
+        );
+
+        assert!(!safe.contains(endpoint));
+        assert!(!safe.contains(token));
+        assert!(safe.contains("[redacted endpoint]"));
+        assert!(safe.contains("[redacted token]"));
+    }
+
+    #[test]
+    fn reporter_shutdown_releases_sender_without_touching_status() {
+        let status = create_status();
+        let stop = Arc::new(AtomicBool::new(false));
+        let sender = start_reporter(
+            settings("https://unused.example.test/report", "secret-player-token"),
+            status.clone(),
+            stop.clone(),
+        )
+        .unwrap();
+
+        stop.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let observation = MonitorObservation {
+                active_boss_flags: Vec::new(),
+                observed_at: SystemTime::UNIX_EPOCH,
+            };
+            if sender.send(observation).is_err() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "reporter did not shut down");
+            thread::yield_now();
+        }
+
+        let status = status.read().expect("reporter must not poison status");
+        assert!(!status.eligible);
+        assert!(!status.warn);
+        assert!(status.last_error.is_none());
     }
 
     #[test]

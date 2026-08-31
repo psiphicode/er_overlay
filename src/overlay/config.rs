@@ -5,7 +5,10 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use crate::overlay::style::{IgniteConfig, TimerMode, VictoryConfig, VictoryMode};
+use crate::{
+    ingest::IngestSettings,
+    overlay::style::{IgniteConfig, TimerMode, VictoryConfig, VictoryMode},
+};
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -16,6 +19,8 @@ pub struct RuntimeConfig {
     pub overlay: OverlayConfig,
     pub timer: TimerSettings,
     pub victory: VictoryCondition,
+    pub ingest: Option<IngestSettings>,
+    pub show_ingest_tally: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +174,7 @@ impl TryFrom<IgniteConfig> for RuntimeConfig {
     type Error = String;
 
     fn try_from(file: IgniteConfig) -> Result<Self, Self::Error> {
+        let ingest = IngestSettings::from_config(file.ingest.as_ref());
         let common = file.common.unwrap_or_default();
         let input = file.input.unwrap_or_default();
         let style = file.style.unwrap_or_default();
@@ -235,6 +241,8 @@ impl TryFrom<IgniteConfig> for RuntimeConfig {
                     .unwrap_or(0),
             },
             victory,
+            ingest,
+            show_ingest_tally: overlay.show_ingest_tally.unwrap_or(true),
         })
     }
 }
@@ -281,11 +289,40 @@ fn modified_time(path: &Path) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::{RuntimeConfig, VictoryCondition};
+    use crate::ingest::IngestSettings;
     use crate::overlay::style::IgniteConfig;
 
     fn parse_runtime(source: &str) -> Result<RuntimeConfig, String> {
         let file: IgniteConfig = toml::from_str(source).map_err(|error| error.to_string())?;
         RuntimeConfig::try_from(file)
+    }
+
+    #[test]
+    fn blank_ingest_configuration_is_disabled() {
+        let runtime = parse_runtime("[ingest]\nurl = \"\"\ntoken = \"\"").unwrap();
+        assert!(runtime.ingest.is_none());
+    }
+
+    #[test]
+    fn shipped_config_leaves_ingest_disabled() {
+        let raw = include_str!("../../dist/overlay_config.toml");
+        let file = toml::from_str::<IgniteConfig>(raw).unwrap();
+        assert!(IngestSettings::from_config(file.ingest.as_ref()).is_none());
+        let ingest = file
+            .ingest
+            .expect("shipped config must explain automark settings");
+        assert!(ingest.url.as_deref().unwrap_or("").is_empty());
+        assert!(ingest.token.as_deref().unwrap_or("").is_empty());
+    }
+
+    #[test]
+    fn ingest_tally_display_defaults_on_and_can_be_disabled() {
+        assert!(parse_runtime("").unwrap().show_ingest_tally);
+        assert!(
+            !parse_runtime("[overlay]\nshow_ingest_tally = false")
+                .unwrap()
+                .show_ingest_tally
+        );
     }
 
     #[test]

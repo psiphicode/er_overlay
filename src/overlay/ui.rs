@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -8,6 +11,7 @@ use imgui::Ui;
 
 use crate::{
     RENDERER_INITIALIZED, debug_log,
+    ingest::{IngestStatus, SharedIngestStatus, create_status, start_reporter, status_line},
     overlay::{
         boss_panel::BossPanel,
         config::{ConfigManager, RuntimeConfig},
@@ -42,6 +46,22 @@ pub struct EROverlayUi {
     startup_started: Instant,
     first_frame_logged: bool,
     corrected_framebuffer_scale: Option<[f32; 2]>,
+    ingest_status: SharedIngestStatus,
+    ingest_stop: Arc<AtomicBool>,
+}
+
+fn append_ingest_text(
+    model: &mut OverlayViewModel,
+    show_ingest_tally: bool,
+    status: &IngestStatus,
+) -> Option<String> {
+    if !show_ingest_tally {
+        return None;
+    }
+    if let Some(line) = status_line(status) {
+        model.lines.push(line);
+    }
+    status.last_error.clone()
 }
 
 impl EROverlayUi {
@@ -93,6 +113,8 @@ impl EROverlayUi {
             startup_started,
             first_frame_logged: false,
             corrected_framebuffer_scale: None,
+            ingest_status: create_status(),
+            ingest_stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -111,12 +133,16 @@ impl EROverlayUi {
         }
     }
 
-    fn render_open(&mut self, ui: &Ui, model: &OverlayViewModel) {
+    fn render_open(&mut self, ui: &Ui, model: &OverlayViewModel, ingest_error: Option<&str>) {
         if let Some(title) = model.title {
             render_centered_line(ui, title);
         }
         for line in &model.lines {
             ui.text(line);
+        }
+        if let Some(error) = ingest_error {
+            let _color = ui.push_style_color(imgui::StyleColor::Text, [1.0, 0.6, 0.2, 1.0]);
+            ui.text_wrapped(format!("[!] last report failed: {error}"));
         }
 
         let line_count = model.lines.len() + usize::from(model.title.is_some());
@@ -220,6 +246,14 @@ impl ImguiRenderLoop for EROverlayUi {
 
         let flag_ids = self.boss_panel.flag_ids();
         debug_log!("[ignite_overlay] Loaded {} boss flags", flag_ids.len());
+        self.ingest_stop.store(false, Ordering::Release);
+        let observation_tx = start_reporter(
+            self.config
+                .as_ref()
+                .and_then(|config| config.ingest.clone()),
+            self.ingest_status.clone(),
+            self.ingest_stop.clone(),
+        );
         self.runtime.start(
             self.state.clone(),
             self.igt.clone(),
@@ -227,7 +261,7 @@ impl ImguiRenderLoop for EROverlayUi {
             self.config_manager.shared(),
             2_008_021,
             100,
-            None,
+            observation_tx,
         );
         debug_log!("[ignite_overlay] Game monitor started successfully.");
     }
@@ -260,7 +294,7 @@ impl ImguiRenderLoop for EROverlayUi {
 
         let io = ui.io();
         let display = [io.display_size[0], io.display_size[1]];
-        let model = {
+        let (model, ingest_error) = {
             let state = self.state.read().ok();
             let in_game_time = self.igt.read().map(|value| *value).unwrap_or(0);
             let timer = self
@@ -272,7 +306,18 @@ impl ImguiRenderLoop for EROverlayUi {
                 .config
                 .as_ref()
                 .map(|config| config.overlay.display_text.as_str());
-            OverlayViewModel::build(state.as_deref(), in_game_time, timer, template)
+            let mut model =
+                OverlayViewModel::build(state.as_deref(), in_game_time, timer, template);
+            let show_ingest_tally = self
+                .config
+                .as_ref()
+                .is_some_and(|config| config.show_ingest_tally);
+            let ingest_error = self
+                .ingest_status
+                .read()
+                .ok()
+                .and_then(|status| append_ingest_text(&mut model, show_ingest_tally, &status));
+            (model, ingest_error)
         };
 
         let layout = OverlayLayout::from_config(self.config.as_deref());
@@ -295,7 +340,7 @@ impl ImguiRenderLoop for EROverlayUi {
                         ui.text_wrapped(error);
                         return;
                     }
-                    self.render_open(ui, &model);
+                    self.render_open(ui, &model, ingest_error.as_deref());
                 });
 
             if !self.first_frame_logged {
@@ -352,5 +397,72 @@ impl ImguiRenderLoop for EROverlayUi {
                 self.first_frame_logged = true;
             }
         }
+    }
+}
+
+impl Drop for EROverlayUi {
+    fn drop(&mut self) {
+        self.ingest_stop.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ingest::{IngestStatus, Tally};
+
+    use super::{OverlayViewModel, append_ingest_text};
+
+    fn model() -> OverlayViewModel {
+        OverlayViewModel {
+            title: None,
+            lines: vec!["normal".to_string()],
+        }
+    }
+
+    #[test]
+    fn ingest_text_is_hidden_when_configured_off() {
+        let mut model = model();
+        let status = IngestStatus {
+            eligible: true,
+            tally: Some(Tally {
+                hits: 8,
+                misses: 4,
+                shots: 12,
+                accuracy: Some(67),
+            }),
+            warn: true,
+            last_error: Some("server error".to_string()),
+            kills_tracked: 2,
+        };
+
+        let expanded_error = append_ingest_text(&mut model, false, &status);
+
+        assert_eq!(model.lines, ["normal"]);
+        assert_eq!(expanded_error, None);
+    }
+
+    #[test]
+    fn ingest_text_includes_compact_line_and_expanded_error() {
+        let mut model = model();
+        let status = IngestStatus {
+            eligible: true,
+            tally: Some(Tally {
+                hits: 8,
+                misses: 4,
+                shots: 12,
+                accuracy: Some(67),
+            }),
+            warn: true,
+            last_error: Some("server error".to_string()),
+            kills_tracked: 2,
+        };
+
+        let expanded_error = append_ingest_text(&mut model, true, &status);
+
+        assert_eq!(
+            model.lines,
+            ["normal", "Hit 8   Miss 4   Total 12   Acc 67%   [!]"]
+        );
+        assert_eq!(expanded_error.as_deref(), Some("server error"));
     }
 }
