@@ -227,6 +227,7 @@ impl ImguiRenderLoop for EROverlayUi {
             self.config_manager.shared(),
             2_008_021,
             100,
+            None,
         );
         debug_log!("[ignite_overlay] Game monitor started successfully.");
     }

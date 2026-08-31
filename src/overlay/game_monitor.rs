@@ -5,8 +5,10 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
+
+use crossbeam::channel::Sender;
 
 use crate::{
     debug_log,
@@ -150,6 +152,29 @@ fn merge_boss_flags(
     changed
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MonitorObservation {
+    pub active_boss_flags: Vec<i32>,
+    pub observed_at: SystemTime,
+}
+
+fn build_monitor_observation(
+    sampled: &HashMap<i32, bool>,
+    boss_flag_ids: &HashSet<i32>,
+    observed_at: SystemTime,
+) -> MonitorObservation {
+    let mut active_boss_flags = boss_flag_ids
+        .iter()
+        .filter(|flag_id| sampled.get(flag_id).copied().unwrap_or(false))
+        .copied()
+        .collect::<Vec<_>>();
+    active_boss_flags.sort_unstable();
+    MonitorObservation {
+        active_boss_flags,
+        observed_at,
+    }
+}
+
 struct MonitorStateUpdate {
     event_flags: Option<HashMap<i32, bool>>,
     key_item_quantity: u32,
@@ -186,6 +211,7 @@ pub fn start_game_monitor(
     key_item_id: i32,
     poll_ms: u64,
     stop: Arc<AtomicBool>,
+    observation_tx: Option<Sender<MonitorObservation>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let update_interval = Duration::from_millis(poll_ms.max(10));
@@ -244,6 +270,14 @@ pub fn start_game_monitor(
                                 &sample.values,
                                 &boss_flag_ids,
                             );
+                            if flags_changed && let Some(sender) = observation_tx.as_ref() {
+                                let observation = build_monitor_observation(
+                                    &published_flags,
+                                    &boss_flag_ids,
+                                    SystemTime::now(),
+                                );
+                                let _ = sender.send(observation);
+                            }
                             for (flag_id, value) in sample.values {
                                 if is_great_rune_flag(flag_id) {
                                     sampled_rune_flags.insert(flag_id, value);
@@ -349,7 +383,7 @@ mod tests {
         collections::{HashMap, HashSet},
         sync::{Arc, RwLock},
         thread,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime},
     };
 
     use crate::overlay::{
@@ -361,9 +395,9 @@ mod tests {
 
     use super::{
         ConfiguredVictory, GREAT_RUNE_FLAGS, MonitorStateUpdate, SampleObservation,
-        configured_victory, initial_published_igt, initial_state_snapshot, merge_boss_flags,
-        monitored_flag_ids, observe_if_current, publish_state_after_igt, reconfigure_victory,
-        write_unpoisoned,
+        build_monitor_observation, configured_victory, initial_published_igt,
+        initial_state_snapshot, merge_boss_flags, monitored_flag_ids, observe_if_current,
+        publish_state_after_igt, reconfigure_victory, write_unpoisoned,
     };
 
     fn runtime_with_victory(victory: VictoryCondition) -> Arc<RuntimeConfig> {
@@ -379,6 +413,18 @@ mod tests {
         .unwrap();
         runtime.victory = victory;
         Arc::new(runtime)
+    }
+
+    #[test]
+    fn monitor_observation_contains_only_sorted_active_boss_flags() {
+        let sampled = HashMap::from([(30, true), (10, false), (20, true), (181, true)]);
+        let boss_ids = HashSet::from([10, 20, 30]);
+        let observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(7);
+
+        let observation = build_monitor_observation(&sampled, &boss_ids, observed_at);
+
+        assert_eq!(observation.active_boss_flags, [20, 30]);
+        assert_eq!(observation.observed_at, observed_at);
     }
 
     fn shared_config(revision: u64, victory: VictoryCondition) -> SharedConfig {

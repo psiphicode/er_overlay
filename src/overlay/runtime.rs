@@ -6,7 +6,13 @@ use std::{
     thread,
 };
 
-use crate::overlay::{config::SharedConfig, data::SharedState, game_monitor::start_game_monitor};
+use crossbeam::channel::Sender;
+
+use crate::overlay::{
+    config::SharedConfig,
+    data::SharedState,
+    game_monitor::{MonitorObservation, start_game_monitor},
+};
 
 pub struct OverlayRuntime {
     monitor_stop: Arc<AtomicBool>,
@@ -29,6 +35,7 @@ impl OverlayRuntime {
         config: SharedConfig,
         key_item_id: i32,
         poll_ms: u64,
+        observation_tx: Option<Sender<MonitorObservation>>,
     ) {
         self.stop();
         self.monitor_stop.store(false, Ordering::Release);
@@ -40,6 +47,7 @@ impl OverlayRuntime {
             key_item_id,
             poll_ms,
             self.monitor_stop.clone(),
+            observation_tx,
         ));
     }
 
