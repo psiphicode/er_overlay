@@ -409,6 +409,7 @@ mod tests {
             overlay: None,
             timer: None,
             victory: None,
+            ingest: None,
         })
         .unwrap();
         runtime.victory = victory;

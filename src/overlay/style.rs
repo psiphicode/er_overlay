@@ -58,6 +58,15 @@ pub struct Boss {
 pub struct Overlay {
     pub display_text: Option<String>,
     pub closed_width: Option<f32>,
+    pub show_ingest_tally: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Ingest {
+    pub url: Option<String>,
+    pub token: Option<String>,
+    pub interval_ms: Option<u64>,
+    pub heartbeat_s: Option<u64>,
 }
 
 pub fn apply_runtime_font_scale(imgui: &mut Context, cfg: &RuntimeConfig) {
@@ -110,6 +119,7 @@ pub struct IgniteConfig {
     pub overlay: Option<Overlay>,
     pub timer: Option<TimerConfig>,
     pub victory: Option<VictoryConfig>,
+    pub ingest: Option<Ingest>,
 }
 
 pub fn apply_style_config(imgui: &mut Context, cfg: &RuntimeConfig) {

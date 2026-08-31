@@ -1,4 +1,5 @@
 pub mod er;
+pub mod ingest;
 pub mod overlay;
 pub mod util;
 
