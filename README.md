@@ -56,6 +56,11 @@ The former `[timer].freeze_on_boss_flag` setting has been removed. Configuration
 
 Release builds require Windows, Rust with the `x86_64-pc-windows-msvc` target, and the Microsoft Visual C++ build tools used by that target. Run the script from PowerShell 5.1 or later at the repository root.
 
+The lockfile currently resolves the `fromsoftware-rs` Git dependencies to
+`eae96dfec94fd9cf6f9d24813c8d08f72019f243`, which includes ELDEN RING
+1.17.0 support. Update and validate the lockfile before claiming support for a
+newer game version.
+
 Build and package the overlay into the default `output/` folder:
 
 ```powershell
