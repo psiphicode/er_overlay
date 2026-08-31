@@ -158,6 +158,36 @@ pub struct MonitorObservation {
     pub observed_at: SystemTime,
 }
 
+pub struct ObservationSenderState {
+    revision: u64,
+    sender: Option<Sender<MonitorObservation>>,
+}
+
+pub type SharedObservationSender = Arc<RwLock<ObservationSenderState>>;
+
+pub fn create_observation_sender() -> SharedObservationSender {
+    Arc::new(RwLock::new(ObservationSenderState {
+        revision: 0,
+        sender: None,
+    }))
+}
+
+pub(crate) fn replace_observation_sender(
+    shared: &SharedObservationSender,
+    sender: Option<Sender<MonitorObservation>>,
+) {
+    let mut state = write_unpoisoned(shared);
+    state.revision = state.revision.wrapping_add(1);
+    state.sender = sender;
+}
+
+pub(crate) fn current_observation_sender(
+    shared: &SharedObservationSender,
+) -> (u64, Option<Sender<MonitorObservation>>) {
+    let state = read_unpoisoned(shared);
+    (state.revision, state.sender.clone())
+}
+
 fn build_monitor_observation(
     sampled: &HashMap<i32, bool>,
     boss_flag_ids: &HashSet<i32>,
@@ -182,6 +212,15 @@ fn deliver_monitor_observation(
     if let Some(sender) = sender {
         let _ = sender.send(observation);
     }
+}
+
+fn monitor_observation_due(
+    flags_changed: bool,
+    last_reporter_revision: u64,
+    reporter_revision: u64,
+    reporter_enabled: bool,
+) -> bool {
+    reporter_enabled && (flags_changed || reporter_revision != last_reporter_revision)
 }
 
 struct MonitorStateUpdate {
@@ -220,7 +259,7 @@ pub fn start_game_monitor(
     key_item_id: i32,
     poll_ms: u64,
     stop: Arc<AtomicBool>,
-    observation_tx: Option<Sender<MonitorObservation>>,
+    observation_tx: SharedObservationSender,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let update_interval = Duration::from_millis(poll_ms.max(10));
@@ -246,6 +285,7 @@ pub fn start_game_monitor(
         let mut published_igt = initial_published_igt(&igt);
         let mut next_flag_error_log = Instant::now();
         let mut last_unresolved_count = None;
+        let mut last_reporter_revision = 0;
 
         while !stop.load(Ordering::Acquire) {
             let cycle_started = Instant::now();
@@ -279,14 +319,23 @@ pub fn start_game_monitor(
                                 &sample.values,
                                 &boss_flag_ids,
                             );
-                            if flags_changed && let Some(sender) = observation_tx.as_ref() {
+                            let (reporter_revision, sender) =
+                                current_observation_sender(&observation_tx);
+                            if monitor_observation_due(
+                                flags_changed,
+                                last_reporter_revision,
+                                reporter_revision,
+                                sender.is_some(),
+                            ) && let Some(sender) = sender
+                            {
                                 let observation = build_monitor_observation(
                                     &published_flags,
                                     &boss_flag_ids,
                                     SystemTime::now(),
                                 );
-                                deliver_monitor_observation(Some(sender), observation);
+                                deliver_monitor_observation(Some(&sender), observation);
                             }
+                            last_reporter_revision = reporter_revision;
                             for (flag_id, value) in sample.values {
                                 if is_great_rune_flag(flag_id) {
                                     sampled_rune_flags.insert(flag_id, value);
@@ -405,9 +454,10 @@ mod tests {
     use super::{
         ConfiguredVictory, GREAT_RUNE_FLAGS, MonitorObservation, MonitorStateUpdate,
         SampleObservation, build_monitor_observation, configured_victory,
-        deliver_monitor_observation, initial_published_igt, initial_state_snapshot,
-        merge_boss_flags, monitored_flag_ids, observe_if_current, publish_state_after_igt,
-        reconfigure_victory, write_unpoisoned,
+        create_observation_sender, current_observation_sender, deliver_monitor_observation,
+        initial_published_igt, initial_state_snapshot, merge_boss_flags, monitor_observation_due,
+        monitored_flag_ids, observe_if_current, publish_state_after_igt, reconfigure_victory,
+        replace_observation_sender, write_unpoisoned,
     };
 
     fn runtime_with_victory(victory: VictoryCondition) -> Arc<RuntimeConfig> {
@@ -448,6 +498,41 @@ mod tests {
         };
 
         deliver_monitor_observation(Some(&sender), observation);
+    }
+
+    #[test]
+    fn monitor_delivery_switches_channels_without_cross_generation_leakage() {
+        let shared = create_observation_sender();
+        let (first_sender, first_receiver) = crossbeam::channel::unbounded();
+        let (second_sender, second_receiver) = crossbeam::channel::unbounded();
+        replace_observation_sender(&shared, Some(first_sender));
+
+        let first = MonitorObservation {
+            active_boss_flags: vec![10],
+            observed_at: SystemTime::UNIX_EPOCH,
+        };
+        let (_, current) = current_observation_sender(&shared);
+        deliver_monitor_observation(current.as_ref(), first.clone());
+        assert_eq!(first_receiver.recv().unwrap(), first);
+
+        replace_observation_sender(&shared, Some(second_sender));
+        let second = MonitorObservation {
+            active_boss_flags: vec![20],
+            observed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+        };
+        let (_, current) = current_observation_sender(&shared);
+        deliver_monitor_observation(current.as_ref(), second.clone());
+
+        assert!(first_receiver.try_recv().is_err());
+        assert_eq!(second_receiver.recv().unwrap(), second);
+    }
+
+    #[test]
+    fn new_reporter_generation_receives_current_snapshot_without_a_flag_change() {
+        assert!(!monitor_observation_due(false, 4, 4, true));
+        assert!(monitor_observation_due(false, 4, 5, true));
+        assert!(!monitor_observation_due(false, 4, 5, false));
+        assert!(monitor_observation_due(true, 5, 5, true));
     }
 
     fn shared_config(revision: u64, victory: VictoryCondition) -> SharedConfig {

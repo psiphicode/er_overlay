@@ -1,8 +1,5 @@
 use std::{
-    sync::{
-        Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
@@ -11,7 +8,7 @@ use imgui::Ui;
 
 use crate::{
     RENDERER_INITIALIZED, debug_log,
-    ingest::{IngestStatus, SharedIngestStatus, create_status, start_reporter, status_line},
+    ingest::{IngestStatus, ReporterController, SharedIngestStatus, create_status, status_line},
     overlay::{
         boss_panel::BossPanel,
         config::{ConfigManager, RuntimeConfig},
@@ -47,12 +44,13 @@ pub struct EROverlayUi {
     first_frame_logged: bool,
     corrected_framebuffer_scale: Option<[f32; 2]>,
     ingest_status: SharedIngestStatus,
-    ingest_stop: Arc<AtomicBool>,
+    reporter: ReporterController,
 }
 
 fn append_ingest_text(
     model: &mut OverlayViewModel,
     show_ingest_tally: bool,
+    show_expanded_error: bool,
     status: &IngestStatus,
 ) -> Option<String> {
     if !show_ingest_tally {
@@ -61,7 +59,9 @@ fn append_ingest_text(
     if let Some(line) = status_line(status) {
         model.lines.push(line);
     }
-    status.last_error.clone()
+    show_expanded_error
+        .then(|| status.last_error.clone())
+        .flatten()
 }
 
 impl EROverlayUi {
@@ -97,6 +97,8 @@ impl EROverlayUi {
 
         let input = InputController::new(config.as_deref());
         let boss_panel = BossPanel::load(&dll_directory, config.as_deref());
+        let ingest_status = create_status();
+        let reporter = ReporterController::new(ingest_status.clone());
         debug_log!("[ignite_overlay] UI state constructed successfully");
         Self {
             last_toggle_time: Instant::now(),
@@ -113,8 +115,8 @@ impl EROverlayUi {
             startup_started,
             first_frame_logged: false,
             corrected_framebuffer_scale: None,
-            ingest_status: create_status(),
-            ingest_stop: Arc::new(AtomicBool::new(false)),
+            ingest_status,
+            reporter,
         }
     }
 
@@ -206,6 +208,8 @@ impl EROverlayUi {
                 }
                 apply_style_config(imgui, config.as_ref());
                 apply_runtime_font_scale(imgui, config.as_ref());
+                self.reporter
+                    .apply_config_reload(Ok::<_, ()>(config.ingest.clone()));
                 self.config = Some(config);
                 self.config_error = None;
                 debug_log!(
@@ -214,6 +218,8 @@ impl EROverlayUi {
             }
             Ok(false) => {}
             Err(error) => {
+                self.reporter
+                    .apply_config_reload(Err::<Option<crate::ingest::IngestSettings>, _>(()));
                 self.config_error = Some(error.clone());
                 debug_log!(
                     "[ignite_overlay] UI config reload failed; keeping previous settings: {error}"
@@ -246,14 +252,12 @@ impl ImguiRenderLoop for EROverlayUi {
 
         let flag_ids = self.boss_panel.flag_ids();
         debug_log!("[ignite_overlay] Loaded {} boss flags", flag_ids.len());
-        self.ingest_stop.store(false, Ordering::Release);
-        let observation_tx = start_reporter(
+        self.reporter.reconfigure(
             self.config
                 .as_ref()
                 .and_then(|config| config.ingest.clone()),
-            self.ingest_status.clone(),
-            self.ingest_stop.clone(),
         );
+        let observation_tx = self.reporter.observation_sender();
         self.runtime.start(
             self.state.clone(),
             self.igt.clone(),
@@ -312,11 +316,9 @@ impl ImguiRenderLoop for EROverlayUi {
                 .config
                 .as_ref()
                 .is_some_and(|config| config.show_ingest_tally);
-            let ingest_error = self
-                .ingest_status
-                .read()
-                .ok()
-                .and_then(|status| append_ingest_text(&mut model, show_ingest_tally, &status));
+            let ingest_error = self.ingest_status.read().ok().and_then(|status| {
+                append_ingest_text(&mut model, show_ingest_tally, self.full_mode, &status)
+            });
             (model, ingest_error)
         };
 
@@ -400,12 +402,6 @@ impl ImguiRenderLoop for EROverlayUi {
     }
 }
 
-impl Drop for EROverlayUi {
-    fn drop(&mut self) {
-        self.ingest_stop.store(true, Ordering::Release);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::ingest::{IngestStatus, Tally};
@@ -435,7 +431,7 @@ mod tests {
             kills_tracked: 2,
         };
 
-        let expanded_error = append_ingest_text(&mut model, false, &status);
+        let expanded_error = append_ingest_text(&mut model, false, true, &status);
 
         assert_eq!(model.lines, ["normal"]);
         assert_eq!(expanded_error, None);
@@ -457,12 +453,32 @@ mod tests {
             kills_tracked: 2,
         };
 
-        let expanded_error = append_ingest_text(&mut model, true, &status);
+        let expanded_error = append_ingest_text(&mut model, true, true, &status);
 
         assert_eq!(
             model.lines,
             ["normal", "Hit 8   Miss 4   Total 12   Acc 67%   [!]"]
         );
         assert_eq!(expanded_error.as_deref(), Some("server error"));
+    }
+
+    #[test]
+    fn compact_ingest_text_does_not_return_expanded_error() {
+        let mut model = model();
+        let status = IngestStatus {
+            eligible: true,
+            tally: Some(Tally::default()),
+            warn: true,
+            last_error: Some("server error".to_string()),
+            kills_tracked: 2,
+        };
+
+        let expanded_error = append_ingest_text(&mut model, true, false, &status);
+
+        assert_eq!(
+            model.lines,
+            ["normal", "Hit 0   Miss 0   Total 0   Acc -   [!]"]
+        );
+        assert_eq!(expanded_error, None);
     }
 }

@@ -50,6 +50,11 @@ const BACKOFF_CAP: Duration = Duration::from_secs(30);
 const MAX_ATTEMPTS: u32 = 5;
 /// Upper bound on how long the worker sleeps before re-checking the stop flag.
 const TICK: Duration = Duration::from_millis(200);
+/// Reporter responses are small JSON documents. This cap prevents a remote
+/// peer from making the overlay allocate ureq's much larger default limit.
+const RESPONSE_BODY_LIMIT: u64 = 16 * 1024;
+/// Maximum size of any remote-controlled diagnostic retained or logged.
+const MAX_DIAGNOSTIC_CHARS: usize = 160;
 
 /// Skip reasons that are the expected result of the protocol working, not
 /// something to log.
@@ -72,7 +77,7 @@ const ROUTINE_SKIPS: [&str; 3] = ["already_fired", "not_on_this_board", "not_a_s
 // ----------------------------------------------------
 //
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IngestSettings {
     pub url: String,
     pub token: String,
@@ -304,27 +309,101 @@ fn classify_rejection(error: String) -> Attempt {
 // ----------------------------------------------------
 //
 
-/// Starts the reporter worker.
-///
-/// Returns the sender the monitor loop should push snapshots into, or `None` if
-/// the feature is not configured , in which case the caller does no extra work
-/// per tick and the mod behaves exactly as it did before.
-pub fn start_reporter(
-    settings: Option<IngestSettings>,
+pub struct ReporterController {
     status: SharedIngestStatus,
+    observation_tx: crate::overlay::game_monitor::SharedObservationSender,
+    worker: Option<ReporterWorker>,
+    settings: Option<IngestSettings>,
+    generation: u64,
+}
+
+impl ReporterController {
+    pub fn new(status: SharedIngestStatus) -> Self {
+        Self {
+            status,
+            observation_tx: crate::overlay::game_monitor::create_observation_sender(),
+            worker: None,
+            settings: None,
+            generation: 0,
+        }
+    }
+
+    pub fn observation_sender(&self) -> crate::overlay::game_monitor::SharedObservationSender {
+        self.observation_tx.clone()
+    }
+
+    /// Replaces the reporter only when its effective settings changed.
+    /// Clearing the shared sender before joining prevents the monitor from
+    /// feeding a retiring generation while it is shutting down.
+    pub fn reconfigure(&mut self, settings: Option<IngestSettings>) -> bool {
+        if self.settings == settings {
+            return false;
+        }
+
+        crate::overlay::game_monitor::replace_observation_sender(&self.observation_tx, None);
+        if let Some(mut worker) = self.worker.take() {
+            worker.shutdown();
+        }
+
+        *self.status.write().unwrap() = IngestStatus::default();
+        self.settings = settings.clone();
+        self.generation += 1;
+
+        if let Some(settings) = settings {
+            let worker = ReporterWorker::start(settings, self.status.clone());
+            crate::overlay::game_monitor::replace_observation_sender(
+                &self.observation_tx,
+                Some(worker.sender.clone()),
+            );
+            self.worker = Some(worker);
+        }
+        true
+    }
+
+    /// Invalid reloads do not alter the last valid reporter generation.
+    pub fn apply_config_reload<E>(&mut self, settings: Result<Option<IngestSettings>, E>) -> bool {
+        settings.is_ok_and(|settings| self.reconfigure(settings))
+    }
+}
+
+struct ReporterWorker {
+    sender: Sender<MonitorObservation>,
     stop: Arc<AtomicBool>,
-) -> Option<Sender<MonitorObservation>> {
-    let settings = settings?;
-    let (tx, rx) = unbounded();
+    thread: Option<thread::JoinHandle<()>>,
+}
 
-    debug_log!(
-        "[automark] [ingest] reporting enabled (interval {}ms, heartbeat {}s)",
-        settings.interval.as_millis(),
-        settings.heartbeat.as_secs()
-    );
+impl ReporterWorker {
+    fn start(settings: IngestSettings, status: SharedIngestStatus) -> Self {
+        let (sender, receiver) = unbounded();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
 
-    thread::spawn(move || run(settings, rx, status, stop));
-    Some(tx)
+        debug_log!(
+            "[automark] [ingest] reporting enabled (interval {}ms, heartbeat {}s)",
+            settings.interval.as_millis(),
+            settings.heartbeat.as_secs()
+        );
+
+        let thread = thread::spawn(move || run(settings, receiver, status, worker_stop));
+        Self {
+            sender,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for ReporterWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 fn run(
@@ -374,15 +453,13 @@ fn run(
 
         // Nothing is sent until the monitor has produced a snapshot, which is
         // what keeps us silent while the player is not yet in world.
-        let due = match last_send {
-            // First contact as soon as there is anything to report from, even
-            // with an empty kill set: it populates the tally and surfaces a bad
-            // token straight away rather than at the first kill of the match.
-            None => have_snapshot,
-            // New kills are coalesced into one request rather than one each.
-            Some(t) if unsent => t.elapsed() >= settings.interval,
-            Some(t) => t.elapsed() >= settings.heartbeat,
-        };
+        let due = send_is_due(
+            have_snapshot,
+            unsent,
+            last_send.map(|sent| sent.elapsed()),
+            settings.interval,
+            settings.heartbeat,
+        );
         if !due {
             continue;
         }
@@ -397,6 +474,25 @@ fn run(
     }
 
     debug_log!("[automark] [ingest] worker exiting");
+}
+
+fn send_is_due(
+    have_snapshot: bool,
+    unsent: bool,
+    since_last_send: Option<Duration>,
+    interval: Duration,
+    heartbeat: Duration,
+) -> bool {
+    if !have_snapshot {
+        return false;
+    }
+    let Some(elapsed) = since_last_send else {
+        // First contact is immediate, even with an empty kill set. This
+        // populates the tally and surfaces a bad token before the first kill.
+        return true;
+    };
+
+    elapsed >= heartbeat || (unsent && elapsed >= interval)
 }
 
 /// Folds a snapshot into the kill set. Returns true if anything was newly seen.
@@ -477,6 +573,11 @@ fn send_with_retry(
             // Underscored so release builds, where `debug_log!` compiles away,
             // do not see it as unused.
             Attempt::Ineligible(_reason) => {
+                let _reason = safe_external_diagnostic(
+                    &_reason,
+                    settings,
+                    "reporting is not active for this match",
+                );
                 debug_log!("[automark] [ingest] idle: {_reason}");
                 // Wipe the tally rather than leave the last match's numbers
                 // sitting on screen in a lobby this does not apply to.
@@ -491,13 +592,13 @@ fn send_with_retry(
                 return;
             }
             Attempt::Rejected(error) => {
-                let error = redact_config_secrets(&error, settings);
+                let error = safe_external_diagnostic(&error, settings, "report rejected");
                 debug_log!("[automark] [ingest] ❌ rejected: {error}");
                 set_warn(status, first_seen.len(), &error);
                 return;
             }
             Attempt::Retryable(error) => {
-                let error = redact_config_secrets(&error, settings);
+                let error = safe_external_diagnostic(&error, settings, "report failed");
                 if attempt == MAX_ATTEMPTS {
                     debug_log!(
                         "[automark] [ingest] ❌ giving up after {attempt} attempts: {error} \
@@ -523,6 +624,47 @@ fn redact_config_secrets(error: &str, settings: &IngestSettings) -> String {
     error
         .replace(&settings.url, "[redacted endpoint]")
         .replace(&settings.token, "[redacted token]")
+}
+
+fn safe_external_diagnostic(diagnostic: &str, settings: &IngestSettings, fallback: &str) -> String {
+    let redacted = redact_config_secrets(diagnostic, settings);
+    let mut normalized = String::with_capacity(redacted.len().min(MAX_DIAGNOSTIC_CHARS * 4));
+    let mut pending_space = false;
+    let mut count = 0;
+    let mut truncated = false;
+
+    for ch in redacted.chars() {
+        if ch.is_control() || ch.is_whitespace() {
+            pending_space |= !normalized.is_empty();
+            continue;
+        }
+        if pending_space {
+            if count == MAX_DIAGNOSTIC_CHARS {
+                truncated = true;
+                break;
+            }
+            normalized.push(' ');
+            count += 1;
+            pending_space = false;
+        }
+        if count == MAX_DIAGNOSTIC_CHARS {
+            truncated = true;
+            break;
+        }
+        normalized.push(ch);
+        count += 1;
+    }
+
+    if normalized.is_empty() {
+        return fallback.to_string();
+    }
+    if truncated {
+        while normalized.chars().count() > MAX_DIAGNOSTIC_CHARS.saturating_sub(3) {
+            normalized.pop();
+        }
+        normalized.push_str("...");
+    }
+    normalized
 }
 
 fn build_body(
@@ -555,7 +697,7 @@ fn send_once(agent: &ureq::Agent, url: &str, body: &str) -> Attempt {
 
     let status = response.status().as_u16();
 
-    let text = match response.body_mut().read_to_string() {
+    let text = match read_response_body(response.body_mut()) {
         Ok(t) => t,
         Err(e) => return Attempt::Retryable(format!("read body (HTTP {status}): {e}")),
     };
@@ -585,6 +727,12 @@ fn send_once(agent: &ureq::Agent, url: &str, body: &str) -> Attempt {
     )
 }
 
+fn read_response_body(body: &mut ureq::Body) -> Result<String, ureq::Error> {
+    body.with_config()
+        .limit(RESPONSE_BODY_LIMIT)
+        .read_to_string()
+}
+
 fn set_warn(status: &SharedIngestStatus, kills_tracked: usize, error: &str) {
     let mut w = status.write().unwrap();
     w.warn = true;
@@ -603,19 +751,26 @@ fn log_accepted(resp: &IngestResponse, settings: &IngestSettings) {
 fn accepted_diagnostics(resp: &IngestResponse, settings: &IngestSettings) -> Vec<String> {
     let mut diagnostics = Vec::with_capacity(resp.fired.len() + resp.skipped.len());
     for f in &resp.fired {
-        let result = redact_config_secrets(f.result.as_deref().unwrap_or("?"), settings);
-        diagnostics.push(format!(
+        let diagnostic = format!(
             "[automark] [ingest] ✅ fired flag {} → cell {:?} ({})",
-            f.flag, f.cell, result
+            f.flag,
+            f.cell,
+            f.result.as_deref().unwrap_or("?")
+        );
+        diagnostics.push(safe_external_diagnostic(
+            &diagnostic,
+            settings,
+            "[automark] [ingest] accepted response",
         ));
     }
     for s in &resp.skipped {
         let reason = s.reason.as_deref().unwrap_or("?");
         if !ROUTINE_SKIPS.contains(&reason) {
-            let reason = redact_config_secrets(reason, settings);
-            diagnostics.push(format!(
-                "[automark] [ingest] skipped flag {}: {}",
-                s.flag, reason
+            let diagnostic = format!("[automark] [ingest] skipped flag {}: {}", s.flag, reason);
+            diagnostics.push(safe_external_diagnostic(
+                &diagnostic,
+                settings,
+                "[automark] [ingest] accepted response",
             ));
         }
     }
@@ -755,6 +910,10 @@ mod tests {
         }))
     }
 
+    fn reporter_sender(reporter: &ReporterController) -> Option<Sender<MonitorObservation>> {
+        crate::overlay::game_monitor::current_observation_sender(&reporter.observation_sender()).1
+    }
+
     #[test]
     fn disabled_without_url_or_token() {
         assert!(IngestSettings::from_config(None).is_none());
@@ -794,6 +953,47 @@ mod tests {
     }
 
     #[test]
+    fn send_deadline_uses_first_interval_or_heartbeat_that_applies() {
+        let interval = Duration::from_secs(90);
+        let heartbeat = Duration::from_secs(60);
+
+        assert!(!send_is_due(false, false, None, interval, heartbeat));
+        assert!(send_is_due(true, false, None, interval, heartbeat));
+        assert!(!send_is_due(
+            true,
+            true,
+            Some(Duration::from_secs(59)),
+            interval,
+            heartbeat,
+        ));
+        assert!(send_is_due(
+            true,
+            true,
+            Some(heartbeat),
+            interval,
+            heartbeat,
+        ));
+
+        let interval = Duration::from_secs(10);
+        let heartbeat = Duration::from_secs(60);
+        assert!(!send_is_due(
+            true,
+            true,
+            Some(Duration::from_secs(9)),
+            interval,
+            heartbeat,
+        ));
+        assert!(send_is_due(true, true, Some(interval), interval, heartbeat,));
+        assert!(send_is_due(
+            true,
+            false,
+            Some(heartbeat),
+            interval,
+            heartbeat,
+        ));
+    }
+
+    #[test]
     fn settings_debug_redacts_endpoint_and_token() {
         let endpoint = "https://private.example.test/report";
         let token = "secret-player-token";
@@ -823,34 +1023,146 @@ mod tests {
     }
 
     #[test]
+    fn external_diagnostics_are_printable_bounded_and_credential_safe() {
+        let endpoint = "https://diagnostic-secret.example.test/report";
+        let token = "diagnostic-secret-token";
+        let settings = settings(endpoint, token).unwrap();
+        let raw = format!(
+            "server\n\t\0echoed {endpoint} and {token}: {}",
+            "界".repeat(400)
+        );
+
+        let safe = safe_external_diagnostic(&raw, &settings, "reporting error");
+
+        assert!(!safe.contains(endpoint));
+        assert!(!safe.contains(token));
+        assert!(!safe.chars().any(char::is_control));
+        assert_eq!(safe.chars().count(), MAX_DIAGNOSTIC_CHARS);
+        assert!(safe.ends_with("..."));
+    }
+
+    #[test]
+    fn external_diagnostic_uses_generic_fallback_when_nothing_is_printable() {
+        let settings = settings("https://unused.example.test/report", "unused-token").unwrap();
+
+        let safe = safe_external_diagnostic("\n\t\0", &settings, "reporting error");
+
+        assert_eq!(safe, "reporting error");
+    }
+
+    #[test]
+    fn response_body_reader_rejects_an_oversized_body() {
+        let mut body = ureq::Body::builder().data(vec![b'x'; RESPONSE_BODY_LIMIT as usize + 1]);
+
+        assert!(read_response_body(&mut body).is_err());
+    }
+
+    #[test]
     fn reporter_shutdown_releases_sender_without_touching_status() {
         let status = create_status();
-        let stop = Arc::new(AtomicBool::new(false));
-        let sender = start_reporter(
-            settings("https://unused.example.test/report", "secret-player-token"),
-            status.clone(),
-            stop.clone(),
-        )
-        .unwrap();
+        let mut reporter = ReporterController::new(status.clone());
+        reporter.reconfigure(settings(
+            "https://unused.example.test/report",
+            "secret-player-token",
+        ));
+        let sender = reporter_sender(&reporter).unwrap();
 
-        stop.store(true, Ordering::Release);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            let observation = MonitorObservation {
-                active_boss_flags: Vec::new(),
-                observed_at: SystemTime::UNIX_EPOCH,
-            };
-            if sender.send(observation).is_err() {
-                break;
-            }
-            assert!(Instant::now() < deadline, "reporter did not shut down");
-            thread::yield_now();
-        }
+        reporter.reconfigure(None);
+
+        let observation = MonitorObservation {
+            active_boss_flags: Vec::new(),
+            observed_at: SystemTime::UNIX_EPOCH,
+        };
+        assert!(sender.send(observation).is_err());
 
         let status = status.read().expect("reporter must not poison status");
         assert!(!status.eligible);
         assert!(!status.warn);
         assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn reporter_reconfiguration_replaces_only_changed_generations() {
+        let status = create_status();
+        let mut reporter = ReporterController::new(status.clone());
+        let first = settings(
+            "https://first-unused.example.test/report",
+            "first-secret-token",
+        );
+
+        assert!(reporter.reconfigure(first.clone()));
+        let first_generation = reporter.generation;
+        let first_sender = reporter_sender(&reporter).unwrap();
+
+        assert!(!reporter.reconfigure(first));
+        let unchanged_sender = reporter_sender(&reporter).unwrap();
+        assert_eq!(reporter.generation, first_generation);
+        assert!(first_sender.same_channel(&unchanged_sender));
+
+        status.write().unwrap().last_error = Some("old generation".to_string());
+        assert!(reporter.reconfigure(settings(
+            "https://second-unused.example.test/report",
+            "second-secret-token",
+        )));
+        let second_sender = reporter_sender(&reporter).unwrap();
+        assert_eq!(reporter.generation, first_generation + 1);
+        assert!(!first_sender.same_channel(&second_sender));
+        assert!(
+            first_sender
+                .send(MonitorObservation {
+                    active_boss_flags: Vec::new(),
+                    observed_at: SystemTime::UNIX_EPOCH,
+                })
+                .is_err()
+        );
+        assert!(status.read().unwrap().last_error.is_none());
+
+        let mut timing_only = settings(
+            "https://second-unused.example.test/report",
+            "second-secret-token",
+        )
+        .unwrap();
+        timing_only.interval = Duration::from_secs(2);
+        assert!(reporter.reconfigure(Some(timing_only)));
+        let third_sender = reporter_sender(&reporter).unwrap();
+        assert!(!second_sender.same_channel(&third_sender));
+        assert!(
+            second_sender
+                .send(MonitorObservation {
+                    active_boss_flags: Vec::new(),
+                    observed_at: SystemTime::UNIX_EPOCH,
+                })
+                .is_err()
+        );
+
+        assert!(reporter.reconfigure(None));
+        assert!(reporter_sender(&reporter).is_none());
+        assert!(
+            third_sender
+                .send(MonitorObservation {
+                    active_boss_flags: Vec::new(),
+                    observed_at: SystemTime::UNIX_EPOCH,
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_config_reload_retains_the_active_reporter_generation() {
+        let status = create_status();
+        let mut reporter = ReporterController::new(status);
+        reporter.reconfigure(settings(
+            "https://retained-unused.example.test/report",
+            "retained-secret-token",
+        ));
+        let generation = reporter.generation;
+        let sender = reporter_sender(&reporter).unwrap();
+
+        assert!(!reporter.apply_config_reload(Err::<Option<IngestSettings>, _>("invalid")));
+
+        let retained = reporter_sender(&reporter).unwrap();
+        assert_eq!(reporter.generation, generation);
+        assert!(sender.same_channel(&retained));
     }
 
     #[test]
@@ -1161,8 +1473,10 @@ mod tests {
         let settings = settings(endpoint, token).unwrap();
         let response: IngestResponse = serde_json::from_str(&format!(
             r#"{{"ok":true,
-                "fired":[{{"flag":1,"cell":2,"result":"hit at {endpoint} using {token}"}}],
-                "skipped":[{{"flag":3,"reason":"skipped at {endpoint} using {token}"}}]}}"#
+                "fired":[{{"flag":1,"cell":2,"result":"hit at {endpoint} using {token}\n{}"}}],
+                "skipped":[{{"flag":3,"reason":"skipped at {endpoint} using {token}\t{}"}}]}}"#,
+            "界".repeat(400),
+            "界".repeat(400),
         ))
         .unwrap();
 
@@ -1174,7 +1488,22 @@ mod tests {
             assert!(!diagnostic.contains(token));
             assert!(diagnostic.contains("[redacted endpoint]"));
             assert!(diagnostic.contains("[redacted token]"));
+            assert!(!diagnostic.chars().any(char::is_control));
+            assert!(diagnostic.chars().count() <= MAX_DIAGNOSTIC_CHARS);
         }
+    }
+
+    #[test]
+    fn manual_attempt_classification_never_returns_diagnostics() {
+        let endpoint = "https://manual-secret.example.test/report";
+        let token = "manual-secret-token";
+        let attempt = Attempt::Retryable(format!("request to {endpoint} used {token}"));
+
+        let class = manual_attempt_class(&attempt);
+
+        assert_eq!(class, "retryable");
+        assert!(!class.contains(endpoint));
+        assert!(!class.contains(token));
     }
 
     #[test]
@@ -1242,6 +1571,15 @@ mod tests {
         assert_eq!(r.fired[0].result.as_deref(), Some("miss"));
     }
 
+    fn manual_attempt_class(attempt: &Attempt) -> &'static str {
+        match attempt {
+            Attempt::Accepted(_) => "accepted",
+            Attempt::Ineligible(_) => "ineligible",
+            Attempt::Rejected(_) => "rejected",
+            Attempt::Retryable(_) => "retryable",
+        }
+    }
+
     /// Exercises the real network path , ureq, TLS, serialisation and response
     /// classification , end to end. Ignored by default because it needs a
     /// network and a token; run it with:
@@ -1266,22 +1604,26 @@ mod tests {
         let agent = build_agent();
         let empty = BTreeMap::new();
 
-        match send_once(&agent, &url, &build_body(&token, &empty).unwrap()) {
-            Attempt::Accepted(r) => println!("accepted, tally = {:?}", r.tally),
-            Attempt::Ineligible(r) => println!("ineligible: {r} (expected while idle)"),
-            Attempt::Rejected(e) => panic!("unexpectedly rejected: {e}"),
-            Attempt::Retryable(e) => panic!("transport failure: {e}"),
+        match manual_attempt_class(&send_once(
+            &agent,
+            &url,
+            &build_body(&token, &empty).unwrap(),
+        )) {
+            "accepted" => println!("accepted"),
+            "ineligible" => println!("ineligible (expected while idle)"),
+            "rejected" => panic!("unexpected permanent rejection"),
+            "retryable" => panic!("report attempt could not complete"),
+            _ => unreachable!(),
         }
 
         // A well-formed but unknown token must come back as a permanent
         // rejection rather than something we would sit and retry.
         let bogus = build_body(&"0".repeat(48), &empty).unwrap();
-        match send_once(&agent, &url, &bogus) {
-            Attempt::Rejected(e) => assert_eq!(e, "unknown_token"),
-            Attempt::Accepted(_) => panic!("an unknown token was accepted"),
-            Attempt::Ineligible(r) => panic!("an unknown token was treated as ineligible: {r}"),
-            Attempt::Retryable(e) => panic!("expected a permanent rejection, got retryable: {e}"),
-        }
+        assert_eq!(
+            manual_attempt_class(&send_once(&agent, &url, &bogus)),
+            "rejected",
+            "an unknown token must be a permanent rejection"
+        );
     }
 
     #[test]
