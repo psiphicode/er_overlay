@@ -164,8 +164,12 @@ impl ConfigManager {
 fn load_config(path: &Path) -> Result<RuntimeConfig, String> {
     let contents = fs::read_to_string(path)
         .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-    let file: IgniteConfig = toml::from_str(&contents)
-        .map_err(|error| format!("Failed to parse {}: {error}", path.display()))?;
+    let file: IgniteConfig = toml::from_str(&contents).map_err(|_| {
+        format!(
+            "Failed to parse {}: invalid TOML configuration",
+            path.display()
+        )
+    })?;
     RuntimeConfig::try_from(file)
         .map_err(|error| format!("Failed to validate {}: {error}", path.display()))
 }
@@ -288,13 +292,77 @@ fn modified_time(path: &Path) -> Option<SystemTime> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeConfig, VictoryCondition};
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{Duration, Instant, SystemTime},
+    };
+
+    use super::{ConfigManager, RuntimeConfig, VictoryCondition};
     use crate::ingest::IngestSettings;
     use crate::overlay::style::IgniteConfig;
 
     fn parse_runtime(source: &str) -> Result<RuntimeConfig, String> {
         let file: IgniteConfig = toml::from_str(source).map_err(|error| error.to_string())?;
         RuntimeConfig::try_from(file)
+    }
+
+    fn config_file(name: &str, contents: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "automark-{name}-{}-{unique}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn startup_parse_error_omits_ingest_url_and_token() {
+        let endpoint = "https://startup-secret.example.test/report";
+        let token = "startup-secret-token";
+        let path = config_file(
+            "startup-secret",
+            &format!("[ingest]\nurl = \"{endpoint}\"\nurl = \"{endpoint}\"\ntoken = \"{token}\""),
+        );
+
+        let (manager, error) = ConfigManager::new(path.clone());
+        fs::remove_file(path).unwrap();
+        let error = error.expect("invalid startup config must return an error");
+
+        assert!(manager.current().is_none());
+        assert!(error.starts_with("Failed to parse "));
+        assert!(!error.contains(endpoint));
+        assert!(!error.contains(token));
+    }
+
+    #[test]
+    fn hot_reload_parse_error_is_safe_for_ui_and_logs() {
+        let endpoint = "https://reload-secret.example.test/report";
+        let token = "reload-secret-token";
+        let path = config_file("reload-secret", "");
+        let (mut manager, startup_error) = ConfigManager::new(path.clone());
+        assert!(startup_error.is_none());
+        fs::write(
+            &path,
+            format!("[ingest]\nurl = \"{endpoint}\"\ntoken = \"{token}\"\ntoken = \"{token}\""),
+        )
+        .unwrap();
+        manager.modified = None;
+        manager.next_check = Instant::now();
+
+        let error = manager
+            .poll(Instant::now() + Duration::from_secs(1))
+            .expect_err("invalid hot reload must return an error");
+        fs::remove_file(path).unwrap();
+
+        assert!(manager.current().is_some());
+        assert!(error.starts_with("Failed to parse "));
+        assert!(!error.contains(endpoint));
+        assert!(!error.contains(token));
     }
 
     #[test]

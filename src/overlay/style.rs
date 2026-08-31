@@ -4,7 +4,7 @@ use crate::overlay::embedded_font::EMBEDDED_FONT;
 use crate::util::introspection::get_dll_directory;
 use imgui::{Context, FontConfig, FontSource, Key, StyleColor};
 use serde::Deserialize;
-use std::fs;
+use std::{fmt, fs};
 
 pub const DEFAULT_PANEL_DIM: [f32; 2] = [0.17, 0.92];
 pub const DEFAULT_PANEL_POS: [f32; 2] = [-10.0, 10.0];
@@ -61,12 +61,24 @@ pub struct Overlay {
     pub show_ingest_tally: Option<bool>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Ingest {
     pub url: Option<String>,
     pub token: Option<String>,
     pub interval_ms: Option<u64>,
     pub heartbeat_s: Option<u64>,
+}
+
+impl fmt::Debug for Ingest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Ingest")
+            .field("url", &self.url.as_ref().map(|_| "[redacted]"))
+            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
+            .field("interval_ms", &self.interval_ms)
+            .field("heartbeat_s", &self.heartbeat_s)
+            .finish()
+    }
 }
 
 pub fn apply_runtime_font_scale(imgui: &mut Context, cfg: &RuntimeConfig) {
@@ -410,4 +422,50 @@ pub fn parse_key_combo(combo: &str) -> Vec<Key> {
         .split('+')
         .filter_map(|part| key_from_name(part.trim()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IgniteConfig, Ingest};
+
+    fn ingest(endpoint: &str, token: &str) -> Ingest {
+        Ingest {
+            url: Some(endpoint.to_string()),
+            token: Some(token.to_string()),
+            interval_ms: Some(1_234),
+            heartbeat_s: Some(67),
+        }
+    }
+
+    #[test]
+    fn ingest_debug_redacts_url_and_token_but_keeps_timing() {
+        let endpoint = "https://debug-secret.example.test/report";
+        let token = "debug-secret-token";
+
+        let debug = format!("{:?}", ingest(endpoint, token));
+
+        assert!(!debug.contains(endpoint));
+        assert!(!debug.contains(token));
+        assert!(debug.contains("[redacted]"));
+        assert!(debug.contains("interval_ms: Some(1234)"));
+        assert!(debug.contains("heartbeat_s: Some(67)"));
+    }
+
+    #[test]
+    fn ignite_config_debug_uses_redacted_ingest_debug() {
+        let endpoint = "https://nested-debug-secret.example.test/report";
+        let token = "nested-debug-secret-token";
+        let config: IgniteConfig = toml::from_str(&format!(
+            "[ingest]\nurl = \"{endpoint}\"\ntoken = \"{token}\"\ninterval_ms = 1234\nheartbeat_s = 67"
+        ))
+        .unwrap();
+
+        let debug = format!("{config:?}");
+
+        assert!(!debug.contains(endpoint));
+        assert!(!debug.contains(token));
+        assert!(debug.contains("[redacted]"));
+        assert!(debug.contains("interval_ms: Some(1234)"));
+        assert!(debug.contains("heartbeat_s: Some(67)"));
+    }
 }

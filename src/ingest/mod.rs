@@ -463,7 +463,7 @@ fn send_with_retry(
 
         match send_once(agent, &settings.url, &body) {
             Attempt::Accepted(resp) => {
-                log_accepted(&resp);
+                log_accepted(&resp, settings);
                 let mut w = status.write().unwrap();
                 *w = IngestStatus {
                     eligible: true,
@@ -594,21 +594,32 @@ fn set_warn(status: &SharedIngestStatus, kills_tracked: usize, error: &str) {
 
 /// Release builds compile `debug_log!` away, leaving these loop bindings unused.
 #[cfg_attr(not(debug_assertions), allow(unused_variables))]
-fn log_accepted(resp: &IngestResponse) {
+fn log_accepted(resp: &IngestResponse, settings: &IngestSettings) {
+    for diagnostic in accepted_diagnostics(resp, settings) {
+        debug_log!("{diagnostic}");
+    }
+}
+
+fn accepted_diagnostics(resp: &IngestResponse, settings: &IngestSettings) -> Vec<String> {
+    let mut diagnostics = Vec::with_capacity(resp.fired.len() + resp.skipped.len());
     for f in &resp.fired {
-        debug_log!(
+        let result = redact_config_secrets(f.result.as_deref().unwrap_or("?"), settings);
+        diagnostics.push(format!(
             "[automark] [ingest] ✅ fired flag {} → cell {:?} ({})",
-            f.flag,
-            f.cell,
-            f.result.as_deref().unwrap_or("?")
-        );
+            f.flag, f.cell, result
+        ));
     }
     for s in &resp.skipped {
         let reason = s.reason.as_deref().unwrap_or("?");
         if !ROUTINE_SKIPS.contains(&reason) {
-            debug_log!("[automark] [ingest] skipped flag {}: {}", s.flag, reason);
+            let reason = redact_config_secrets(reason, settings);
+            diagnostics.push(format!(
+                "[automark] [ingest] skipped flag {}: {}",
+                s.flag, reason
+            ));
         }
     }
+    diagnostics
 }
 
 /// Sleeps in short slices so teardown is not held up by a long backoff.
@@ -1141,6 +1152,29 @@ mod tests {
         assert_eq!(r.fired.len(), 1);
         assert_eq!(r.fired[0].cell, Some(37));
         assert_eq!(r.tally.unwrap().accuracy, Some(67));
+    }
+
+    #[test]
+    fn accepted_diagnostics_redact_result_and_reason() {
+        let endpoint = "https://accepted-secret.example.test/report";
+        let token = "accepted-secret-token";
+        let settings = settings(endpoint, token).unwrap();
+        let response: IngestResponse = serde_json::from_str(&format!(
+            r#"{{"ok":true,
+                "fired":[{{"flag":1,"cell":2,"result":"hit at {endpoint} using {token}"}}],
+                "skipped":[{{"flag":3,"reason":"skipped at {endpoint} using {token}"}}]}}"#
+        ))
+        .unwrap();
+
+        let diagnostics = accepted_diagnostics(&response, &settings);
+
+        assert_eq!(diagnostics.len(), 2);
+        for diagnostic in diagnostics {
+            assert!(!diagnostic.contains(endpoint));
+            assert!(!diagnostic.contains(token));
+            assert!(diagnostic.contains("[redacted endpoint]"));
+            assert!(diagnostic.contains("[redacted token]"));
+        }
     }
 
     #[test]
