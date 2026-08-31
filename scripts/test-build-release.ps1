@@ -46,6 +46,31 @@ if ($rootPackage.Count -ne 1) {
 }
 $archivePath = Join-Path $testRoot "er-overlay-$($rootPackage[0].version)-windows-x86_64.zip"
 
+if (-not ('ErOverlayReleaseTestNativeEnvironment' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class ErOverlayReleaseTestNativeEnvironment
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true,
+        EntryPoint = "SetEnvironmentVariableW")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetEnvironmentVariable(string name, string value);
+
+    public static bool Set(string name, string value)
+    {
+        return SetEnvironmentVariable(name, value);
+    }
+
+    public static bool Remove(string name)
+    {
+        return SetEnvironmentVariable(name, null);
+    }
+}
+'@
+}
+
 function Get-RelativeInventoryPath {
     param(
         [string]$Root,
@@ -198,11 +223,66 @@ function Assert-ProfilePathFixtureRejected {
 function Get-ProcessEnvironmentSnapshot {
     param([string[]]$Names)
 
+    $variables = [Environment]::GetEnvironmentVariables('Process')
     $snapshot = @{}
     foreach ($name in $Names) {
-        $snapshot[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+        $exists = Test-ProcessEnvironmentVariableExists -Variables $variables -Name $name
+        $value = [Environment]::GetEnvironmentVariable($name, 'Process')
+        if ($exists -and $null -eq $value) {
+            $value = [string]::Empty
+        }
+        $snapshot[$name] = [pscustomobject]@{
+            Exists = $exists
+            Value = $value
+        }
     }
     return $snapshot
+}
+
+function Test-ProcessEnvironmentVariableExists {
+    param(
+        [Collections.IDictionary]$Variables,
+        [string]$Name
+    )
+
+    foreach ($existingName in $Variables.Keys) {
+        if ([string]::Equals([string]$existingName, $Name, [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Set-ProcessEnvironmentVariableExact {
+    param(
+        [string]$Name,
+        [AllowEmptyString()][string]$Value,
+        [switch]$Remove
+    )
+
+    $succeeded = if ($Remove) {
+        [ErOverlayReleaseTestNativeEnvironment]::Remove($Name)
+    } else {
+        [ErOverlayReleaseTestNativeEnvironment]::Set($Name, $Value)
+    }
+    if (-not $succeeded) {
+        throw New-Object ComponentModel.Win32Exception(
+            [Runtime.InteropServices.Marshal]::GetLastWin32Error(),
+            "Could not set process environment variable $Name"
+        )
+    }
+}
+
+function Restore-ProcessEnvironmentSnapshot {
+    param([hashtable]$Snapshot)
+
+    foreach ($name in $Snapshot.Keys) {
+        if ($Snapshot[$name].Exists) {
+            Set-ProcessEnvironmentVariableExact -Name $name -Value $Snapshot[$name].Value
+        } else {
+            Set-ProcessEnvironmentVariableExact -Name $name -Remove
+        }
+    }
 }
 
 function Assert-ProcessEnvironmentSnapshot {
@@ -211,9 +291,15 @@ function Assert-ProcessEnvironmentSnapshot {
         [string]$Label
     )
 
+    $variables = [Environment]::GetEnvironmentVariables('Process')
     foreach ($name in $Expected.Keys) {
+        $exists = Test-ProcessEnvironmentVariableExists -Variables $variables -Name $name
         $actual = [Environment]::GetEnvironmentVariable($name, 'Process')
-        if (-not [string]::Equals($actual, $Expected[$name], [StringComparison]::Ordinal)) {
+        if ($exists -and $null -eq $actual) {
+            $actual = [string]::Empty
+        }
+        if ($exists -ne $Expected[$name].Exists -or
+            -not [string]::Equals($actual, $Expected[$name].Value, [StringComparison]::Ordinal)) {
             throw "$Label did not restore process environment variable $name"
         }
     }
@@ -233,7 +319,7 @@ function Assert-ConfiguredTargetRustFlagsPreserved {
         'ER_OVERLAY_RELEASE_REMAP_FORWARD',
         'ER_OVERLAY_RELEASE_INNER_RUSTC_WRAPPER'
     )
-    $savedTargetFlags = [Environment]::GetEnvironmentVariable($variableName, 'Process')
+    $savedTargetFlags = Get-ProcessEnvironmentSnapshot -Names @($variableName)
     [Environment]::SetEnvironmentVariable(
         $variableName,
         '--er-overlay-invalid-configured-target-flag',
@@ -255,7 +341,7 @@ function Assert-ConfiguredTargetRustFlagsPreserved {
         }
         Assert-ProcessEnvironmentSnapshot -Expected $environmentSnapshot -Label 'Failed release build'
     } finally {
-        [Environment]::SetEnvironmentVariable($variableName, $savedTargetFlags, 'Process')
+        Restore-ProcessEnvironmentSnapshot -Snapshot $savedTargetFlags
     }
 }
 
@@ -287,8 +373,10 @@ fn main() {
         throw "Test rustc wrapper build failed with exit code $LASTEXITCODE"
     }
 
-    $savedRustcWrapper = $env:RUSTC_WRAPPER
-    $savedMarker = $env:ER_OVERLAY_TEST_WRAPPER_MARKER
+    $wrapperEnvironmentSnapshot = Get-ProcessEnvironmentSnapshot -Names @(
+        'RUSTC_WRAPPER',
+        'ER_OVERLAY_TEST_WRAPPER_MARKER'
+    )
     try {
         $env:RUSTC_WRAPPER = $wrapperProbePath
         $env:ER_OVERLAY_TEST_WRAPPER_MARKER = $wrapperProbeMarkerPath
@@ -300,8 +388,7 @@ fn main() {
             throw 'Failed release build did not restore the existing rustc wrapper'
         }
     } finally {
-        $env:RUSTC_WRAPPER = $savedRustcWrapper
-        $env:ER_OVERLAY_TEST_WRAPPER_MARKER = $savedMarker
+        Restore-ProcessEnvironmentSnapshot -Snapshot $wrapperEnvironmentSnapshot
     }
 }
 
@@ -332,11 +419,11 @@ function Assert-SpacedUserProfileBuild {
             "--remap-path-prefix=$ActualUserProfile=/redacted/user",
             "--remap-path-prefix=$actualProfileForward=/redacted/user"
         ) -join $separator
-        $env:CXXFLAGS = (@($environmentSnapshot.CXXFLAGS, '/DER_OVERLAY_SPACED_PROFILE_TEST=1') | Where-Object {
+        $env:CXXFLAGS = (@($environmentSnapshot.CXXFLAGS.Value, '/DER_OVERLAY_SPACED_PROFILE_TEST=1') | Where-Object {
             -not [string]::IsNullOrWhiteSpace($_)
         }) -join ' '
         $actualNativeTrimFlag = "/d1trimfile:`"$ActualUserProfile`""
-        $env:_CL_ = (@($environmentSnapshot.'_CL_', $actualNativeTrimFlag) | Where-Object {
+        $env:_CL_ = (@($environmentSnapshot['_CL_'].Value, $actualNativeTrimFlag) | Where-Object {
             -not [string]::IsNullOrWhiteSpace($_)
         }) -join ' '
 
@@ -345,9 +432,44 @@ function Assert-SpacedUserProfileBuild {
         Assert-NoUserProfilePathInBinary -Path (Join-Path $Path 'er_overlay.dll') `
             -UserProfile $ActualUserProfile
     } finally {
-        foreach ($name in $environmentSnapshot.Keys) {
-            [Environment]::SetEnvironmentVariable($name, $environmentSnapshot[$name], 'Process')
+        Restore-ProcessEnvironmentSnapshot -Snapshot $environmentSnapshot
+    }
+}
+
+function Assert-ProcessEnvironmentSnapshotRoundTrip {
+    $absentName = 'ER_OVERLAY_TEST_SNAPSHOT_ABSENT'
+    $emptyName = 'ER_OVERLAY_TEST_SNAPSHOT_EMPTY'
+    $caseName = 'ER_OVERLAY_TEST_SNAPSHOT_CASE'
+    $names = @($absentName, $emptyName, $caseName)
+    $originalSnapshot = Get-ProcessEnvironmentSnapshot -Names $names
+
+    try {
+        Set-ProcessEnvironmentVariableExact -Name $absentName -Remove
+        Set-ProcessEnvironmentVariableExact -Name $emptyName -Value ([string]::Empty)
+        Set-ProcessEnvironmentVariableExact -Name $caseName.ToLowerInvariant() -Value 'original'
+        $snapshot = Get-ProcessEnvironmentSnapshot -Names $names
+        if ($snapshot[$absentName].Exists) {
+            $matchingNames = @([Environment]::GetEnvironmentVariables('Process').Keys | Where-Object {
+                [string]::Equals([string]$_, $absentName, [StringComparison]::OrdinalIgnoreCase)
+            }) -join ', '
+            throw "Process environment snapshot did not preserve an absent variable: matching names=$matchingNames"
         }
+        if (-not $snapshot[$emptyName].Exists -or
+            -not [string]::Equals($snapshot[$emptyName].Value, [string]::Empty, [StringComparison]::Ordinal)) {
+            throw "Process environment snapshot did not preserve a present empty variable: exists=$($snapshot[$emptyName].Exists), value-is-null=$($null -eq $snapshot[$emptyName].Value)"
+        }
+        if (-not $snapshot[$caseName].Exists -or
+            -not [string]::Equals($snapshot[$caseName].Value, 'original', [StringComparison]::Ordinal)) {
+            throw 'Process environment snapshot did not find a differently cased variable name'
+        }
+
+        Set-ProcessEnvironmentVariableExact -Name $absentName -Value 'changed'
+        Set-ProcessEnvironmentVariableExact -Name $emptyName -Value 'changed'
+        Set-ProcessEnvironmentVariableExact -Name $caseName -Value 'changed'
+        Restore-ProcessEnvironmentSnapshot -Snapshot $snapshot
+        Assert-ProcessEnvironmentSnapshot -Expected $snapshot -Label 'Snapshot round trip'
+    } finally {
+        Restore-ProcessEnvironmentSnapshot -Snapshot $originalSnapshot
     }
 }
 
@@ -408,6 +530,7 @@ function Get-ShortPath {
 }
 
 try {
+    Assert-ProcessEnvironmentSnapshotRoundTrip
     if (Test-Path -LiteralPath $testRoot) {
         throw "Test root already exists: $testRoot"
     }
