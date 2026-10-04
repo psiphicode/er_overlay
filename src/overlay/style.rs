@@ -59,6 +59,8 @@ pub struct Overlay {
     pub display_text: Option<String>,
     pub closed_width: Option<f32>,
     pub show_ingest_tally: Option<bool>,
+    /// Show the personal-best line under the ingest tally. On when missing.
+    pub show_pb: Option<bool>,
 }
 
 #[derive(Clone, Deserialize)]

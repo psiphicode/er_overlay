@@ -21,6 +21,8 @@ pub struct RuntimeConfig {
     pub victory: VictoryCondition,
     pub ingest: Option<IngestSettings>,
     pub show_ingest_tally: bool,
+    /// Personal-best line under the tally. Only drawn when the tally is.
+    pub show_pb: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -247,6 +249,7 @@ impl TryFrom<IgniteConfig> for RuntimeConfig {
             victory,
             ingest,
             show_ingest_tally: overlay.show_ingest_tally.unwrap_or(true),
+            show_pb: overlay.show_pb.unwrap_or(true),
         })
     }
 }
@@ -391,6 +394,17 @@ mod tests {
                 .unwrap()
                 .show_ingest_tally
         );
+    }
+
+    #[test]
+    fn pb_display_defaults_on_and_can_be_disabled() {
+        assert!(parse_runtime("").unwrap().show_pb);
+        assert!(
+            parse_runtime("[overlay]\nshow_ingest_tally = true")
+                .unwrap()
+                .show_pb
+        );
+        assert!(!parse_runtime("[overlay]\nshow_pb = false").unwrap().show_pb);
     }
 
     #[test]
