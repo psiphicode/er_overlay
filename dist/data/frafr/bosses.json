@@ -1254,6 +1254,11 @@
         "place": "Église du bourgeon",
         "flag_id": 2044450800,
         "rememberance": 21
+      },
+      {
+        "boss": "Devonia du Creuset",
+        "place": "",
+        "flag_id": 2045470200
       }
     ],
     "dlc": 1

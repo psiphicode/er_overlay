@@ -41,13 +41,22 @@ use crate::overlay::game_monitor::MonitorObservation;
 use crate::{debug_log, overlay::style::Ingest, util::time::rfc3339_millis_utc};
 
 /// Wall-clock budget for one request, DNS through response body.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Generous on purpose. The server writes the shot before it builds its reply,
+/// so a slow reply is almost always a kill that already landed. A tight budget
+/// turned those into "failures" and sent the worker into a backoff chain, which
+/// is what held a kill made during it back by up to half a minute.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Backoff schedule is `1s, 2s, 4s, …` capped at [`BACKOFF_CAP`].
 const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// Attempts per send before giving up. The kill set is retained either way and
 /// rides along on the next send, so giving up costs a delay, not data.
 const MAX_ATTEMPTS: u32 = 5;
+/// How soon to try again after a send gave up with nothing delivered. Sooner
+/// than the heartbeat, so a kill caught in an outage is not held for a whole
+/// one, but slow enough not to hammer a server that is down.
+const UNDELIVERED_RETRY: Duration = Duration::from_secs(15);
 /// Upper bound on how long the worker sleeps before re-checking the stop flag.
 const TICK: Duration = Duration::from_millis(200);
 /// Reporter responses are small JSON documents. This cap prevents a remote
@@ -163,6 +172,124 @@ pub struct Tally {
     /// spurious retry storm.
     #[serde(default)]
     pub accuracy: Option<i32>,
+    /// Median seconds from one of this captain's squares falling to the next,
+    /// on Elden Battleship's own match clock , not IGT. `None` until enough
+    /// consecutive auto-fired squares have landed for a median to mean
+    /// anything (the server's own floor), and always `None` for anyone
+    /// marking squares by hand, since a clicked square is stamped with
+    /// whenever they got round to clicking it rather than the kill time.
+    #[serde(default)]
+    pub pace: Option<f64>,
+    /// Hulls this player has sunk this match. Older servers omit it, which
+    /// reads as 0.
+    #[serde(default)]
+    pub sunk: u32,
+}
+
+/// This player's best single past game on this board, as the server reports
+/// it. Rendered verbatim, like [`Tally`].
+///
+/// Every field is `Option` for the same reason [`Tally::accuracy`] is: a best
+/// that has not been set yet arrives as an explicit `null`, which
+/// `#[serde(default)]` alone would refuse.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct Pb {
+    #[serde(default)]
+    pub hits: Option<u32>,
+    #[serde(default)]
+    pub sunk: Option<u32>,
+    /// Most shots taken in one game. Older servers omit it.
+    #[serde(default)]
+    pub shots: Option<u32>,
+    /// Whole percent.
+    #[serde(default)]
+    pub accuracy: Option<i32>,
+    /// Median seconds per square, lower is better. See [`Tally::pace`].
+    #[serde(default)]
+    pub pace: Option<f64>,
+}
+
+/// The phase Elden Battleship's own match clock is in. Mirrors the server's
+/// `ClockPayload.phase`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClockPhase {
+    Starting,
+    Preparation,
+    Match,
+    Paused,
+}
+
+/// Elden Battleship's own match clock, as last reported , not IGT. Pace is
+/// measured against this clock, not the game's, so a player comparing the two
+/// needs to see the one pace is actually keeping time against.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct Clock {
+    pub phase: ClockPhase,
+    /// Seconds left in the STARTING/PREPARATION countdown, or elapsed since
+    /// MATCH began. Never both , see [`ClockPhase`].
+    pub seconds: u32,
+    /// False while the room is stopped. The warning window before a pause
+    /// takes hold still counts as running , the clock has not stopped yet.
+    pub running: bool,
+}
+
+/// A [`Clock`] plus the instant it arrived, which is what lets the overlay
+/// keep counting between replies instead of freezing on a stale number.
+///
+/// The server sends elapsed/remaining seconds rather than a timestamp, on
+/// purpose: a player's PC clock being wrong must not throw this off. Replies
+/// can be up to one `heartbeat` apart while idle, so extrapolating locally ,
+/// see [`clock_now`] , is what keeps the number moving in between.
+#[derive(Debug, Clone, Copy)]
+pub struct ClockSnapshot {
+    pub clock: Clock,
+    pub received_at: Instant,
+}
+
+/// The clock's live phase and value right now, extrapolated from the last
+/// reply.
+///
+/// PREPARATION rolls straight over into MATCH when it runs out, counting up
+/// from there, because what follows it is never in doubt. Holding "Prep 0:00"
+/// until the next reply , up to a whole `heartbeat` away , read as a frozen
+/// clock to players waiting on it to start, and they went late. STARTING
+/// cannot do the same: how long PREPARATION lasts is the room's setting, which
+/// the reply does not carry, so it holds at 0 and the worker asks the server
+/// straight away instead , see [`countdown_expired`].
+pub fn clock_reading(snapshot: &ClockSnapshot) -> (ClockPhase, u32) {
+    let ClockSnapshot { clock, received_at } = snapshot;
+    if !clock.running {
+        return (clock.phase, clock.seconds);
+    }
+    let drift = received_at.elapsed().as_secs() as u32;
+    match clock.phase {
+        // MATCH counts up; STARTING/PREPARATION count down towards 0 , PAUSED
+        // never reaches here since `running` is false whenever the room is
+        // stopped.
+        ClockPhase::Match => (ClockPhase::Match, clock.seconds.saturating_add(drift)),
+        ClockPhase::Preparation if drift >= clock.seconds => (ClockPhase::Match, drift - clock.seconds),
+        phase => (phase, clock.seconds.saturating_sub(drift)),
+    }
+}
+
+/// The clock's live value right now , see [`clock_reading`].
+pub fn clock_now(snapshot: &ClockSnapshot) -> u32 {
+    clock_reading(snapshot).1
+}
+
+/// Whether the countdown on screen has run out since the last reply.
+///
+/// When it has, the worker reports early rather than waiting for the
+/// heartbeat, so the reply that names the next phase arrives within a request
+/// of the change instead of up to a `heartbeat` after it.
+fn countdown_expired(status: &SharedIngestStatus) -> bool {
+    let status = status.read().unwrap();
+    status.clock.is_some_and(|snapshot| {
+        snapshot.clock.running
+            && matches!(snapshot.clock.phase, ClockPhase::Starting | ClockPhase::Preparation)
+            && snapshot.received_at.elapsed().as_secs_f64() >= f64::from(snapshot.clock.seconds)
+    })
 }
 
 /// What the overlay renders. Every field is set from the last response , the
@@ -174,6 +301,17 @@ pub struct IngestStatus {
     /// stays off screen in a lobby that kill reporting does not apply to.
     pub eligible: bool,
     pub tally: Option<Tally>,
+    /// Elden Battleship's own match clock, as of the last reply. `None`
+    /// whenever `tally` would also be absent for the same reasons, plus the
+    /// rare case of a live match with no start marker yet.
+    pub clock: Option<ClockSnapshot>,
+    /// This player's personal bests on this board, as of the last reply.
+    /// `None` on a first game, on an older server, or when the server's PB
+    /// lookup failed, all of which mean no PB line.
+    pub pb: Option<Pb>,
+    /// Which stats the current match already beats, as decided by the server
+    /// (`"hits"`, `"sunk"`, `"accuracy"`, `"pace"`). Never recomputed here.
+    pub pb_beaten: Vec<String>,
     /// Last send failed, or was rejected for a reason outside [`INELIGIBLE`].
     /// Without this a stale tally looks identical to a live one.
     pub warn: bool,
@@ -218,6 +356,12 @@ struct IngestResponse {
     error: Option<String>,
     #[serde(default, deserialize_with = "lenient_tally")]
     tally: Option<Tally>,
+    #[serde(default, deserialize_with = "lenient_clock")]
+    clock: Option<Clock>,
+    #[serde(default, deserialize_with = "lenient_pb")]
+    pb: Option<Pb>,
+    #[serde(default, deserialize_with = "lenient_beaten")]
+    pb_beaten: Vec<String>,
     #[serde(default)]
     fired: Vec<FiredEntry>,
     #[serde(default)]
@@ -260,6 +404,42 @@ where
 {
     let raw = serde_json::Value::deserialize(deserializer)?;
     Ok(serde_json::from_value::<Option<Tally>>(raw).ok().flatten())
+}
+
+/// Same leniency as [`lenient_tally`], for the same reason: the clock is
+/// cosmetic too, and a shape this build does not recognise must cost us the
+/// clock, never the report.
+fn lenient_clock<'de, D>(deserializer: D) -> Result<Option<Clock>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value::<Option<Clock>>(raw).ok().flatten())
+}
+
+/// Same leniency again, for the personal bests: a `pb` this build cannot read
+/// must cost us the PB line, never the report.
+///
+/// Objects only: serde will happily read a struct from an array, and an
+/// all-null PB from `[]` would draw a line of dashes where there should be none.
+fn lenient_pb<'de, D>(deserializer: D) -> Result<Option<Pb>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    if !raw.is_object() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_value::<Pb>(raw).ok())
+}
+
+/// As [`lenient_pb`], falling back to an empty list: nothing marked beaten.
+fn lenient_beaten<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value::<Vec<String>>(raw).unwrap_or_default())
 }
 
 /// Result of one HTTP attempt, classified into what the caller should do next.
@@ -422,6 +602,10 @@ fn run(
     let mut unsent = false;
     let mut have_snapshot = false;
     let mut last_send: Option<Instant> = None;
+    // When the last send gave up without the server ever answering, measured
+    // from when it gave up - a backoff chain can outlast `interval` many times
+    // over, so timing this from the start would retry straight away.
+    let mut undelivered_since: Option<Instant> = None;
 
     while !stop.load(Ordering::SeqCst) {
         // Absorb everything queued, then block briefly so the stop flag stays
@@ -459,18 +643,25 @@ fn run(
             last_send.map(|sent| sent.elapsed()),
             settings.interval,
             settings.heartbeat,
-        );
+        ) || undelivered_since
+            .is_some_and(|failed| failed.elapsed() >= UNDELIVERED_RETRY)
+            // Still spaced by `interval`, so a reply that rounds the last
+            // half-second of a countdown down to 0 costs one more request, not
+            // a burst of them.
+            || (countdown_expired(&status)
+                && last_send.is_some_and(|sent| sent.elapsed() >= settings.interval));
         if !due {
             continue;
         }
 
         last_send = Some(Instant::now());
         // Cleared before sending, not after: on failure the kills stay in the
-        // local set and ride along on the next heartbeat rather than retrying
-        // every `interval`.
+        // local set and ride along on the next send rather than retrying every
+        // `interval` - `UNDELIVERED_RETRY` decides when that is.
         unsent = false;
 
-        send_with_retry(&agent, &settings, &first_seen, &status, &stop);
+        let settled = send_with_retry(&agent, &settings, &mut first_seen, &rx, &status, &stop);
+        undelivered_since = (!settled).then(Instant::now);
     }
 
     debug_log!("[automark] [ingest] worker exiting");
@@ -532,43 +723,61 @@ fn build_agent() -> ureq::Agent {
     config.into()
 }
 
+/// Sends the kill set, retrying transient failures with backoff.
+///
+/// Returns true once the server has answered either way (accepted, ineligible
+/// or rejected) and false when it gave up without an answer, which is the only
+/// case worth trying again soon.
+///
+/// The body is rebuilt for every attempt, and the backoff waits keep absorbing
+/// monitor snapshots: a kill made while this is retrying goes out on the very
+/// next attempt, and cuts the wait before it short, rather than queueing behind
+/// the whole chain.
 fn send_with_retry(
     agent: &ureq::Agent,
     settings: &IngestSettings,
-    first_seen: &BTreeMap<i32, SystemTime>,
+    first_seen: &mut BTreeMap<i32, SystemTime>,
+    rx: &Receiver<MonitorObservation>,
     status: &SharedIngestStatus,
     stop: &Arc<AtomicBool>,
-) {
-    let body = match build_body(&settings.token, first_seen) {
-        Ok(body) => body,
-        Err(e) => {
-            // Serialising our own struct should not fail; if it somehow does,
-            // there is nothing to retry.
-            debug_log!("[automark] [ingest] ❌ could not serialise payload: {e}");
-            set_warn(status, first_seen.len(), &format!("payload error: {e}"));
-            return;
-        }
-    };
-
+) -> bool {
     let mut backoff = BACKOFF_START;
 
     for attempt in 1..=MAX_ATTEMPTS {
         if stop.load(Ordering::SeqCst) {
-            return;
+            return true;
         }
 
-        match send_once(agent, &settings.url, &body) {
+        let body = match build_body(&settings.token, first_seen) {
+            Ok(body) => body,
+            Err(e) => {
+                // Serialising our own struct should not fail; if it somehow
+                // does, there is nothing to retry.
+                debug_log!("[automark] [ingest] ❌ could not serialise payload: {e}");
+                set_warn(status, first_seen.len(), &format!("payload error: {e}"));
+                return true;
+            }
+        };
+
+        match send_once(agent, &settings.url, &body, pin_region(&settings.url, attempt)) {
             Attempt::Accepted(resp) => {
                 log_accepted(&resp, settings);
+                let clock = resp.clock.map(|clock| ClockSnapshot {
+                    clock,
+                    received_at: Instant::now(),
+                });
                 let mut w = status.write().unwrap();
                 *w = IngestStatus {
                     eligible: true,
                     tally: resp.tally,
+                    clock,
+                    pb: resp.pb,
+                    pb_beaten: resp.pb_beaten,
                     warn: false,
                     last_error: None,
                     kills_tracked: first_seen.len(),
                 };
-                return;
+                return true;
             }
             // Underscored so release builds, where `debug_log!` compiles away,
             // do not see it as unused.
@@ -579,23 +788,27 @@ fn send_with_retry(
                     "reporting is not active for this match",
                 );
                 debug_log!("[automark] [ingest] idle: {_reason}");
-                // Wipe the tally rather than leave the last match's numbers
-                // sitting on screen in a lobby this does not apply to.
+                // Wipe the tally, clock and PBs rather than leave the last
+                // match's numbers sitting on screen in a lobby this does not
+                // apply to.
                 let mut w = status.write().unwrap();
                 *w = IngestStatus {
                     eligible: false,
                     tally: None,
+                    clock: None,
+                    pb: None,
+                    pb_beaten: Vec::new(),
                     warn: false,
                     last_error: None,
                     kills_tracked: first_seen.len(),
                 };
-                return;
+                return true;
             }
             Attempt::Rejected(error) => {
                 let error = safe_external_diagnostic(&error, settings, "report rejected");
                 debug_log!("[automark] [ingest] ❌ rejected: {error}");
                 set_warn(status, first_seen.len(), &error);
-                return;
+                return true;
             }
             Attempt::Retryable(error) => {
                 let error = safe_external_diagnostic(&error, settings, "report failed");
@@ -605,16 +818,70 @@ fn send_with_retry(
                          , kills retained for the next send"
                     );
                     set_warn(status, first_seen.len(), &error);
-                    return;
+                    return false;
                 }
                 debug_log!(
                     "[automark] [ingest] ⚠ attempt {attempt} failed ({error}); retrying in {}s",
                     backoff.as_secs()
                 );
-                if !sleep_interruptible(backoff, stop) {
-                    return;
+                match backoff_wait(backoff, rx, first_seen, stop) {
+                    BackoffEnd::Stopped => return true,
+                    BackoffEnd::NewKill => {
+                        debug_log!("[automark] [ingest] new kill during backoff; retrying now");
+                    }
+                    BackoffEnd::Elapsed => {}
                 }
                 backoff = (backoff * 2).min(BACKOFF_CAP);
+            }
+        }
+    }
+    false
+}
+
+/// How a backoff wait ended.
+#[derive(Debug, PartialEq, Eq)]
+enum BackoffEnd {
+    Elapsed,
+    /// A snapshot carried a flag never seen before; retry without waiting.
+    NewKill,
+    Stopped,
+}
+
+/// Waits out one backoff step, folding in monitor snapshots as they arrive.
+///
+/// Ends early on a new kill, so it goes out on the next attempt instead of
+/// after the rest of the chain. Snapshots that bring nothing new are absorbed
+/// without ending the wait.
+fn backoff_wait(
+    total: Duration,
+    rx: &Receiver<MonitorObservation>,
+    first_seen: &mut BTreeMap<i32, SystemTime>,
+    stop: &Arc<AtomicBool>,
+) -> BackoffEnd {
+    let deadline = Instant::now() + total;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return BackoffEnd::Stopped;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return BackoffEnd::Elapsed;
+        }
+        match rx.recv_timeout(TICK.min(remaining)) {
+            Ok(snap) => {
+                if merge(first_seen, snap) {
+                    return BackoffEnd::NewKill;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            // No more snapshots can come; sit out the rest without spinning.
+            // The main loop notices the disconnect once this send finishes.
+            Err(RecvTimeoutError::Disconnected) => {
+                return if sleep_interruptible(remaining, stop) {
+                    BackoffEnd::Elapsed
+                } else {
+                    BackoffEnd::Stopped
+                };
             }
         }
     }
@@ -682,13 +949,36 @@ fn build_body(
     serde_json::to_string(&Payload { token, kills })
 }
 
-fn send_once(agent: &ureq::Agent, url: &str, body: &str) -> Attempt {
-    let response = agent
+/// The Supabase region Elden Battleship's database lives in.
+///
+/// Edge functions run in the region nearest the CALLER unless told otherwise,
+/// which is backwards for this one: a report makes about ten round trips to the
+/// database and only one to the player. Run near a player in Europe or the
+/// Americas, every one of those ten crossed to Singapore and back, and a reply
+/// took 4-6 seconds (October 2026 logs: Toronto 6.2s, Zurich 4.4s, Tokyo and
+/// Mumbai, nearest the database, 2.2s). Run beside the database, only the one
+/// trip to the player is long.
+const PINNED_REGION: &str = "ap-southeast-1";
+
+/// Whether to ask for [`PINNED_REGION`]: only on a Supabase function URL, the
+/// one place the header means anything, and only on the first attempt of a
+/// send. A pinned request is never re-routed if that region is down, so every
+/// retry goes out unpinned - the worst a regional outage can cost is one
+/// attempt, after which reporting behaves exactly as it did before the pin.
+fn pin_region(url: &str, attempt: u32) -> bool {
+    attempt == 1 && url.contains(".supabase.co/functions/")
+}
+
+fn send_once(agent: &ureq::Agent, url: &str, body: &str, pinned: bool) -> Attempt {
+    let mut request = agent
         .post(url)
         .header("Content-Type", "application/json")
         // Belt and braces alongside the disabled pool: no connection is kept.
-        .header("Connection", "close")
-        .send(body);
+        .header("Connection", "close");
+    if pinned {
+        request = request.header("x-region", PINNED_REGION);
+    }
+    let response = request.send(body);
 
     let mut response = match response {
         Ok(r) => r,
@@ -798,60 +1088,232 @@ fn sleep_interruptible(total: Duration, stop: &Arc<AtomicBool>) -> bool {
 // ----------------------------------------------------
 //
 
-/// Renders the one-line status, or `None` when the line should be hidden.
+/// Renders the ingest status as 0, 1 or 3 lines, or an empty `Vec` when
+/// nothing should be shown at all.
 ///
-/// Everything shown comes from the last response; nothing is computed here.
+/// Up to three short lines rather than one long one, and in this order, so
+/// the caller (ui.rs) can put them ahead of whatever `display_text` produces:
+/// Elden Battleship's own numbers , its match clock and the pace measured
+/// against it , read as this feature's headline, with this player's hit/miss
+/// and total/accuracy underneath. Splitting them out is also what lets the
+/// caller interleave `display_text`'s lines (IGT, deaths, whatever a player
+/// has configured) after all three rather than after one combined line.
 ///
-/// The ordering matters. A failure is shown *before* the eligibility check,
-/// because the failures worth telling someone about , a bad token, or being in
-/// two live matches , all happen before a first report ever succeeds. Gating
-/// them behind "we already had a good response" meant the compact line stayed
-/// empty in exactly the situation where the player most needs to know something
-/// is wrong.
-pub fn status_line(status: &IngestStatus) -> Option<String> {
+/// Everything shown comes from the last response, extrapolated where the
+/// clock is concerned , see [`clock_now`]. Nothing here re-derives what the
+/// server already decided.
+///
+/// The ordering of the checks matters. A failure is shown *before* the
+/// eligibility check, because the failures worth telling someone about , a
+/// bad token, or being in two live matches , all happen before a first report
+/// ever succeeds. Gating them behind "we already had a good response" meant
+/// the compact line stayed empty in exactly the situation where the player
+/// most needs to know something is wrong.
+pub fn status_lines(status: &IngestStatus) -> Vec<String> {
     if status.warn {
-        let reason = status
-            .last_error
-            .as_deref()
-            .map(short_reason)
-            .unwrap_or_else(|| "failed".to_string());
-
-        return Some(match status.tally {
-            // There is a tally to show, so keep the line narrow and leave the
-            // reason to expanded mode.
-            Some(t) => format!("{}   [!]", tally_text(&t)),
+        let Some(t) = &status.tally else {
             // Nothing else to show, so the reason IS the line.
-            None => format!("Automark [!] {reason}"),
-        });
+            let reason = status
+                .last_error
+                .as_deref()
+                .map(short_reason)
+                .unwrap_or_else(|| "failed".to_string());
+            return vec![format!("Automark [!] {reason}")];
+        };
+
+        // There is a tally to show, so keep the marker on the last line and
+        // leave the reason to expanded mode.
+        let mut lines = Vec::with_capacity(3);
+        if let Some(clock) = &status.clock {
+            lines.push(clock_pace_line(clock, t.pace));
+        }
+        lines.push(hit_miss_line(t));
+        lines.push(format!("{}   [!]", total_acc_line(t)));
+        return lines;
     }
 
     if !status.eligible {
-        return None;
+        return Vec::new();
     }
 
-    Some(match status.tally {
-        Some(t) => tally_text(&t),
+    let Some(t) = &status.tally else {
         // Accepted, but the server sent no tally. Still worth confirming the
         // round trip is working.
-        None => "Automark connected".to_string(),
-    })
+        return vec!["Automark connected".to_string()];
+    };
+
+    let mut lines = Vec::with_capacity(3);
+    if let Some(clock) = &status.clock {
+        lines.push(clock_pace_line(clock, t.pace));
+    }
+    lines.push(hit_miss_line(t));
+    lines.push(total_acc_line(t));
+    lines
 }
 
 /// ASCII only. The overlay's embedded font covers Latin characters, so a warning
 /// sign or an em dash renders as a `?` box, and the reassurance the line exists
 /// for turns into a puzzle.
-fn tally_text(t: &Tally) -> String {
-    // A dash whenever there is no percentage to state: before the first shot the
-    // server sends null, and nothing has missed yet, so `0%` would be a lie.
-    let acc = match t.accuracy {
+///
+/// Split from the totals below rather than one four-field line , a shorter
+/// pair of lines reads faster mid-fight than one long one.
+fn hit_miss_line(t: &Tally) -> String {
+    format!("Hit {}   Miss {}", t.hits, t.misses)
+}
+
+fn total_acc_line(t: &Tally) -> String {
+    format!("Total {}   Acc {}", t.shots, acc_text(t))
+}
+
+/// "67%", or a dash whenever there is no percentage to state: before the first
+/// shot the server sends null, and nothing has missed yet, so `0%` would be a lie.
+fn acc_text(t: &Tally) -> String {
+    match t.accuracy {
         Some(pct) if t.shots > 0 => format!("{pct}%"),
         _ => "-".to_string(),
+    }
+}
+
+/// "2:34", or a dash before there have been enough auto-fired squares in a row
+/// for a median to mean anything , see the doc comment on [`Tally::pace`].
+fn pace_text(pace: Option<f64>) -> String {
+    match pace {
+        Some(seconds) => {
+            let secs = seconds.round().max(0.0) as u32;
+            format!("{}:{:02}", secs / 60, secs % 60)
+        }
+        None => "-".to_string(),
+    }
+}
+
+/// [`status_lines`] with this player's personal bests beside the stats they
+/// belong to, plus a Sunk row:
+///
+/// ```text
+/// Prep: 3:25   Pace -  (2:23)
+/// Hit 0   Miss 0  (27)
+/// Total 0  (40)   Acc -  (71%)
+/// Sunk 0  (4)
+/// ```
+///
+/// Bests ride on the existing lines rather than a PB line of their own, so no
+/// one line ends up far wider than the rest and the panel stays tight.
+///
+/// Falls back to exactly [`status_lines`] whenever [`shows_bests`] is false. A
+/// best that has not been set yet gets no brackets.
+///
+/// A stat the server lists in `pb_beaten` shows `(NEW)` instead of the old best,
+/// since the current value is already on the line. Which stats count as beaten
+/// is the server's call (thresholds, ties, which way is better) and is never
+/// recomputed here; if a beaten stat has no current value, the old best shows
+/// instead. ASCII only, for the same reason as [`hit_miss_line`].
+pub fn status_lines_with_pb(status: &IngestStatus) -> Vec<String> {
+    if !shows_bests(status) {
+        return status_lines(status);
+    }
+    let (Some(t), Some(pb)) = (&status.tally, &status.pb) else {
+        return status_lines(status);
+    };
+    let beaten = |stat: &str| status.pb_beaten.iter().any(|s| s == stat);
+    let mark = |line: String, stat: &str, has_current: bool, best: Option<String>| {
+        if beaten(stat) && has_current {
+            format!("{line}  (NEW)")
+        } else if let Some(best) = best {
+            format!("{line}  ({best})")
+        } else {
+            line
+        }
     };
 
-    format!(
-        "Hit {}   Miss {}   Total {}   Acc {}",
-        t.hits, t.misses, t.shots, acc
-    )
+    let mut lines = Vec::with_capacity(4);
+    if let Some(clock) = &status.clock {
+        lines.push(mark(
+            clock_pace_line(clock, t.pace),
+            "pace",
+            t.pace.is_some(),
+            pb.pace.map(|p| pace_text(Some(p))),
+        ));
+    }
+    lines.push(mark(
+        hit_miss_line(t),
+        "hits",
+        true,
+        pb.hits.map(|v| v.to_string()),
+    ));
+    // Two stats on one line, each with its own best.
+    let total = mark(
+        format!("Total {}", t.shots),
+        "shots",
+        true,
+        pb.shots.map(|v| v.to_string()),
+    );
+    let acc = mark(
+        format!("Acc {}", acc_text(t)),
+        "accuracy",
+        t.accuracy.is_some() && t.shots > 0,
+        pb.accuracy.map(|v| format!("{v}%")),
+    );
+    lines.push(format!("{total}   {acc}"));
+    lines.push(mark(
+        format!("Sunk {}", t.sunk),
+        "sunk",
+        true,
+        pb.sunk.map(|v| v.to_string()),
+    ));
+    lines
+}
+
+/// Whether [`status_lines_with_pb`] will draw bests (and so its Sunk row):
+/// not while warning, not outside a supported match, and only with both a
+/// tally and a `pb` (absent on a first game, an older server, or a failed
+/// lookup).
+pub fn shows_bests(status: &IngestStatus) -> bool {
+    !status.warn && status.eligible && status.tally.is_some() && status.pb.is_some()
+}
+
+/// Everything the overlay draws: the ingest lines first, then `display_text`'s.
+///
+/// When bests are showing and `display_text` is a single line (Elden
+/// Battleship's setup ships `Deaths: {deaths}`), that line goes on the end of
+/// the Sunk row instead of taking a row of its own, "Sunk 0  (4)   Deaths: 0",
+/// so the panel is one line shorter. A multi-line `display_text` is left alone:
+/// there is no telling which of its lines would read sensibly beside Sunk.
+pub fn combine_with_display_text(
+    status: &IngestStatus,
+    show_pb: bool,
+    display: Vec<String>,
+) -> Vec<String> {
+    let mut lines = if show_pb {
+        status_lines_with_pb(status)
+    } else {
+        status_lines(status)
+    };
+    let joins_sunk_row =
+        show_pb && shows_bests(status) && display.len() == 1 && !display[0].trim().is_empty();
+    match lines.last_mut() {
+        Some(sunk_row) if joins_sunk_row => {
+            sunk_row.push_str("   ");
+            sunk_row.push_str(display[0].trim());
+        }
+        _ => lines.extend(display),
+    }
+    lines
+}
+
+/// "Match: 47:37   Pace 2:23" , Elden Battleship's own headline: its match
+/// clock, extrapolated to right now, and this player's pace against it.
+/// Deliberately its own line rather than folded into the tally: this is the
+/// site's own measurement, on the site's own clock, and the split keeps it
+/// read as one thing rather than a field tacked onto a shot tally.
+fn clock_pace_line(snapshot: &ClockSnapshot, pace: Option<f64>) -> String {
+    let (phase, secs) = clock_reading(snapshot);
+    let label = match phase {
+        ClockPhase::Starting => "Starting",
+        ClockPhase::Preparation => "Prep",
+        ClockPhase::Match => "Match",
+        ClockPhase::Paused => "Paused",
+    };
+    format!("{label}: {}:{:02}   Pace {}", secs / 60, secs % 60, pace_text(pace))
 }
 
 /// Turns a wire error into something readable at a glance mid-fight.
@@ -899,6 +1361,64 @@ mod tests {
         ));
         assert_eq!(seen[&1], t0);
         assert_eq!(seen[&2], t0);
+    }
+
+    fn observation(flags: Vec<i32>) -> MonitorObservation {
+        MonitorObservation {
+            active_boss_flags: flags,
+            observed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(100),
+        }
+    }
+
+    #[test]
+    fn backoff_wait_ends_early_on_a_new_kill() {
+        let (tx, rx) = unbounded();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut seen = BTreeMap::new();
+        merge(&mut seen, observation(vec![1]));
+
+        // Already known, then new: the first is absorbed, the second ends it.
+        tx.send(observation(vec![1])).unwrap();
+        tx.send(observation(vec![1, 2])).unwrap();
+
+        let started = Instant::now();
+        let end = backoff_wait(Duration::from_secs(30), &rx, &mut seen, &stop);
+        assert_eq!(end, BackoffEnd::NewKill);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(seen.contains_key(&2));
+    }
+
+    #[test]
+    fn backoff_wait_sits_out_snapshots_with_nothing_new() {
+        let (tx, rx) = unbounded();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut seen = BTreeMap::new();
+        merge(&mut seen, observation(vec![1]));
+        tx.send(observation(vec![1])).unwrap();
+
+        let end = backoff_wait(Duration::from_millis(300), &rx, &mut seen, &stop);
+        assert_eq!(end, BackoffEnd::Elapsed);
+    }
+
+    #[test]
+    fn backoff_wait_honours_stop_and_disconnect() {
+        let (tx, rx) = unbounded::<MonitorObservation>();
+        let stop = Arc::new(AtomicBool::new(true));
+        let mut seen = BTreeMap::new();
+        assert_eq!(
+            backoff_wait(Duration::from_secs(30), &rx, &mut seen, &stop),
+            BackoffEnd::Stopped
+        );
+
+        // A dropped monitor must not turn the wait into a spin.
+        drop(tx);
+        stop.store(false, Ordering::SeqCst);
+        let started = Instant::now();
+        assert_eq!(
+            backoff_wait(Duration::from_millis(300), &rx, &mut seen, &stop),
+            BackoffEnd::Elapsed
+        );
+        assert!(started.elapsed() >= Duration::from_millis(250));
     }
 
     fn settings(url: &str, token: &str) -> Option<IngestSettings> {
@@ -1269,22 +1789,26 @@ mod tests {
                 misses: 4,
                 shots: 12,
                 accuracy: Some(67),
+                pace: None,
+                sunk: 0,
             }),
             ..Default::default()
         };
-        assert!(status_line(&s).is_some());
+        assert!(!status_lines(&s).is_empty());
 
         // Then an unsupported lobby, applying what the Ineligible arm writes.
         s = IngestStatus {
             eligible: false,
             tally: None,
+            clock: None,
+            pb: None,
+            pb_beaten: Vec::new(),
             warn: false,
             last_error: None,
             kills_tracked: s.kills_tracked,
         };
-        assert_eq!(
-            status_line(&s),
-            None,
+        assert!(
+            status_lines(&s).is_empty(),
             "no line at all in an unsupported lobby"
         );
         assert!(
@@ -1300,7 +1824,7 @@ mod tests {
     #[test]
     fn status_line_hidden_until_something_is_known() {
         // Nothing has come back yet, and nothing is wrong: stay off screen.
-        assert_eq!(status_line(&IngestStatus::default()), None);
+        assert!(status_lines(&IngestStatus::default()).is_empty());
     }
 
     /// The state that used to render nothing at all in compact mode.
@@ -1314,13 +1838,16 @@ mod tests {
         let s = IngestStatus {
             eligible: false,
             tally: None,
+            clock: None,
+            pb: None,
+            pb_beaten: Vec::new(),
             warn: true,
             last_error: Some("ambiguous_match".into()),
             kills_tracked: 3,
         };
-        let line = status_line(&s).expect("a pre-success failure must still show");
-        assert_eq!(line, "Automark [!] in 2 live matches");
-        assert!(line.is_ascii(), "must render in the embedded font: {line}");
+        let lines = status_lines(&s);
+        assert_eq!(lines, vec!["Automark [!] in 2 live matches".to_string()]);
+        assert!(lines[0].is_ascii(), "must render in the embedded font: {}", lines[0]);
     }
 
     #[test]
@@ -1338,7 +1865,7 @@ mod tests {
                 last_error: Some(wire.into()),
                 ..Default::default()
             };
-            assert_eq!(status_line(&s).unwrap(), format!("Automark [!] {shown}"));
+            assert_eq!(status_lines(&s), vec![format!("Automark [!] {shown}")]);
         }
     }
 
@@ -1349,10 +1876,12 @@ mod tests {
             last_error: Some("some_enormous_reason_nobody_has_seen_before_at_all".into()),
             ..Default::default()
         };
-        let line = status_line(&s).unwrap();
+        let lines = status_lines(&s);
+        assert_eq!(lines.len(), 1);
         assert!(
-            line.len() <= "Automark [!] ".len() + 24,
-            "panel would stretch: {line}"
+            lines[0].len() <= "Automark [!] ".len() + 24,
+            "panel would stretch: {}",
+            lines[0]
         );
     }
 
@@ -1370,13 +1899,18 @@ mod tests {
         let t = r.tally.expect("tally should survive a null accuracy");
         assert_eq!((t.hits, t.misses, t.shots, t.accuracy), (0, 0, 0, None));
 
-        // And it renders as a dash, not as a failure and not as 0%.
+        // And it renders as a dash, not as a failure and not as 0%. No clock in
+        // this reply, so there is no Match/Pace line at all - just the tally,
+        // split into its usual two lines.
         let s = IngestStatus {
             eligible: true,
             tally: r.tally,
             ..Default::default()
         };
-        assert_eq!(status_line(&s).unwrap(), "Hit 0   Miss 0   Total 0   Acc -");
+        assert_eq!(
+            status_lines(&s),
+            vec!["Hit 0   Miss 0".to_string(), "Total 0   Acc -".to_string()]
+        );
     }
 
     /// A tally shape we do not understand must cost us the tally, never the
@@ -1403,11 +1937,15 @@ mod tests {
             tally: None,
             ..Default::default()
         };
-        assert_eq!(status_line(&s).unwrap(), "Automark connected");
+        assert_eq!(status_lines(&s), vec!["Automark connected".to_string()]);
     }
 
+    /// The full three-line shape, in order: Elden Battleship's own clock and
+    /// this player's pace against it first, then hit/miss, then total/
+    /// accuracy. This is the exact scenario a live match produces once pace
+    /// has cleared its floor and a clock has arrived.
     #[test]
-    fn status_line_renders_response() {
+    fn status_line_renders_all_three_lines_in_order() {
         let s = IngestStatus {
             eligible: true,
             tally: Some(Tally {
@@ -1415,23 +1953,65 @@ mod tests {
                 misses: 4,
                 shots: 12,
                 accuracy: Some(67),
+                pace: Some(154.0),
+                sunk: 0,
+            }),
+            clock: Some(ClockSnapshot {
+                clock: Clock { phase: ClockPhase::Match, seconds: 812, running: false },
+                received_at: Instant::now(),
             }),
             ..Default::default()
         };
         assert_eq!(
-            status_line(&s).unwrap(),
-            "Hit 8   Miss 4   Total 12   Acc 67%"
+            status_lines(&s),
+            vec![
+                "Match: 13:32   Pace 2:34".to_string(),
+                "Hit 8   Miss 4".to_string(),
+                "Total 12   Acc 67%".to_string(),
+            ]
+        );
+    }
+
+    /// No clock yet (the rare room missing a start marker) means no Match/
+    /// Pace line at all, even with a pace value sitting in the tally: pace is
+    /// only ever shown next to the clock it was measured against. The tally
+    /// still splits into its usual two lines.
+    #[test]
+    fn status_line_has_no_clock_line_without_a_clock() {
+        let s = IngestStatus {
+            eligible: true,
+            tally: Some(Tally {
+                hits: 8,
+                misses: 4,
+                shots: 12,
+                accuracy: Some(67),
+                pace: Some(154.0),
+                sunk: 0,
+            }),
+            clock: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            status_lines(&s),
+            vec!["Hit 8   Miss 4".to_string(), "Total 12   Acc 67%".to_string()]
         );
     }
 
     #[test]
-    fn status_line_dashes_accuracy_before_first_shot() {
+    fn status_line_dashes_accuracy_and_pace_before_first_shot() {
         let s = IngestStatus {
             eligible: true,
             tally: Some(Tally::default()),
+            clock: Some(ClockSnapshot {
+                clock: Clock { phase: ClockPhase::Match, seconds: 0, running: false },
+                received_at: Instant::now(),
+            }),
             ..Default::default()
         };
-        assert_eq!(status_line(&s).unwrap(), "Hit 0   Miss 0   Total 0   Acc -");
+        assert_eq!(
+            status_lines(&s),
+            vec!["Match: 0:00   Pace -".to_string(), "Hit 0   Miss 0".to_string(), "Total 0   Acc -".to_string()]
+        );
     }
 
     #[test]
@@ -1443,14 +2023,282 @@ mod tests {
                 misses: 4,
                 shots: 12,
                 accuracy: Some(67),
+                pace: None,
+                sunk: 0,
             }),
             warn: true,
             ..Default::default()
         };
-        let line = status_line(&s).unwrap();
-        assert!(line.ends_with("[!]"), "{line}");
+        let lines = status_lines(&s);
+        let last = lines.last().unwrap();
+        assert!(last.ends_with("[!]"), "{last}");
         // Every character must exist in the Latin-only embedded font.
-        assert!(line.is_ascii(), "tally line must stay ASCII: {line}");
+        for line in &lines {
+            assert!(line.is_ascii(), "tally line must stay ASCII: {line}");
+        }
+    }
+
+    /// The clock/pace line comes FIRST, ahead of the tally, and reads a
+    /// dash-free label per phase rather than a raw enum name.
+    #[test]
+    fn status_line_leads_with_the_clock() {
+        for (phase, label) in [
+            (ClockPhase::Starting, "Starting"),
+            (ClockPhase::Preparation, "Prep"),
+            (ClockPhase::Match, "Match"),
+            (ClockPhase::Paused, "Paused"),
+        ] {
+            let s = IngestStatus {
+                eligible: true,
+                tally: Some(Tally::default()),
+                clock: Some(ClockSnapshot {
+                    clock: Clock { phase, seconds: 154, running: false },
+                    received_at: Instant::now(),
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                status_lines(&s),
+                vec![
+                    format!("{label}: 2:34   Pace -"),
+                    "Hit 0   Miss 0".to_string(),
+                    "Total 0   Acc -".to_string(),
+                ]
+            );
+        }
+    }
+
+    /// The whole point of sending seconds rather than a timestamp: between
+    /// replies the overlay keeps counting on its own, in the right direction
+    /// for the phase.
+    #[test]
+    fn clock_extrapolates_between_replies() {
+        let counting_up = ClockSnapshot {
+            clock: Clock { phase: ClockPhase::Match, seconds: 100, running: true },
+            received_at: Instant::now() - Duration::from_secs(5),
+        };
+        assert_eq!(clock_now(&counting_up), 105);
+
+        let counting_down = ClockSnapshot {
+            clock: Clock { phase: ClockPhase::Preparation, seconds: 100, running: true },
+            received_at: Instant::now() - Duration::from_secs(5),
+        };
+        assert_eq!(clock_now(&counting_down), 95);
+
+        // A paused clock never moves, no matter how long ago the reply arrived.
+        let paused = ClockSnapshot {
+            clock: Clock { phase: ClockPhase::Match, seconds: 100, running: false },
+            received_at: Instant::now() - Duration::from_secs(400),
+        };
+        assert_eq!(clock_now(&paused), 100);
+
+        // A countdown never goes negative, even extrapolated well past zero.
+        let overrun = ClockSnapshot {
+            clock: Clock { phase: ClockPhase::Starting, seconds: 3, running: true },
+            received_at: Instant::now() - Duration::from_secs(30),
+        };
+        assert_eq!(clock_now(&overrun), 0);
+        assert_eq!(clock_reading(&overrun).0, ClockPhase::Starting);
+    }
+
+    /// Only the first attempt of a send is pinned, and only to Supabase, so a
+    /// regional outage costs one attempt rather than every report.
+    #[test]
+    fn region_pin_is_first_attempt_supabase_only() {
+        let supabase = "https://abc.supabase.co/functions/v1/auto-fire";
+        assert!(pin_region(supabase, 1));
+        assert!(!pin_region(supabase, 2));
+        assert!(!pin_region(supabase, MAX_ATTEMPTS));
+        assert!(!pin_region("https://example.test/report", 1));
+    }
+
+    /// A stand-in for the endpoint on 127.0.0.1: answers the Nth request with
+    /// the Nth canned reply (the last one repeats) and keeps every request's
+    /// head, lowercased, so a test can ask what was actually sent. The URL it
+    /// hands back ends in a Supabase-shaped path, so [`pin_region`] treats it as
+    /// the real thing.
+    fn fake_endpoint(replies: Vec<(u16, &'static str)>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/abc.supabase.co/functions/v1/auto-fire",
+            listener.local_addr().unwrap()
+        );
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        thread::spawn(move || {
+            for (n, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { continue };
+                let mut raw = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                // The head, then however much body Content-Length says follows it.
+                let head_end = loop {
+                    let read = stream.read(&mut chunk).unwrap_or(0);
+                    if read == 0 {
+                        break None;
+                    }
+                    raw.extend_from_slice(&chunk[..read]);
+                    if let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(at + 4);
+                    }
+                };
+                let Some(head_end) = head_end else { continue };
+                let head = String::from_utf8_lossy(&raw[..head_end]).to_lowercase();
+                let body_len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while raw.len() < head_end + body_len {
+                    let read = stream.read(&mut chunk).unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&chunk[..read]);
+                }
+                log.lock().unwrap().push(head);
+                let (status, body) = replies[n.min(replies.len() - 1)];
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (url, seen)
+    }
+
+    const PREP_ONE_SECOND_LEFT: &str = r#"{"ok":true,"fired":[],"skipped":[],"tally":{"hits":0,"misses":0,"shots":0,"accuracy":null,"pace":null,"sunk":0},"clock":{"phase":"preparation","seconds":1,"running":true}}"#;
+    const MATCH_JUST_STARTED: &str = r#"{"ok":true,"fired":[],"skipped":[],"tally":{"hits":0,"misses":0,"shots":0,"accuracy":null,"pace":null,"sunk":0},"clock":{"phase":"match","seconds":0,"running":true}}"#;
+
+    fn test_settings(url: String) -> IngestSettings {
+        IngestSettings {
+            url,
+            token: "0".repeat(48),
+            interval: Duration::from_secs(1),
+            heartbeat: Duration::from_secs(60),
+        }
+    }
+
+    /// End to end through the real send path: the first attempt asks for the
+    /// database's region, the server fails it, and the retry goes out WITHOUT
+    /// the header and lands. This is the guarantee that a regional outage costs
+    /// one attempt and nothing more.
+    #[test]
+    fn a_failed_pinned_attempt_retries_unpinned() {
+        let (url, seen) = fake_endpoint(vec![(503, ""), (200, MATCH_JUST_STARTED)]);
+        let (_tx, rx) = unbounded();
+        let status = create_status();
+        let settled = send_with_retry(
+            &build_agent(),
+            &test_settings(url),
+            &mut BTreeMap::new(),
+            &rx,
+            &status,
+            &Arc::new(AtomicBool::new(false)),
+        );
+
+        assert!(settled, "the retry should have been answered");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one failed attempt, one retry");
+        assert!(seen[0].contains("x-region: ap-southeast-1"), "first attempt pinned:\n{}", seen[0]);
+        assert!(!seen[1].contains("x-region"), "retry must go out unpinned:\n{}", seen[1]);
+        let status = status.read().unwrap();
+        assert!(status.eligible && !status.warn, "the retry's reply should be what is shown");
+    }
+
+    /// End to end through the real worker: a reply saying Prep has one second
+    /// left must bring the next report forward to the moment it runs out, not
+    /// leave it for the 60-second heartbeat - and that report's answer is what
+    /// moves the clock line on to Match.
+    #[test]
+    fn an_expiring_countdown_reports_early() {
+        let (url, seen) = fake_endpoint(vec![(200, PREP_ONE_SECOND_LEFT), (200, MATCH_JUST_STARTED)]);
+        let (tx, rx) = unbounded();
+        let status = create_status();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let (status, stop, settings) = (Arc::clone(&status), Arc::clone(&stop), test_settings(url));
+            thread::spawn(move || run(settings, rx, status, stop))
+        };
+        // In world: the first snapshot is what lets the worker send at all.
+        tx.send(MonitorObservation {
+            active_boss_flags: Vec::new(),
+            observed_at: SystemTime::now(),
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while seen.lock().unwrap().len() < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        stop.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+
+        assert!(
+            seen.lock().unwrap().len() >= 2,
+            "an expired countdown should report within seconds, not wait 60s for the heartbeat"
+        );
+        let shown = status.read().unwrap().clock.map(|c| c.clock.phase);
+        assert_eq!(shown, Some(ClockPhase::Match), "the early report's answer moves the clock on");
+    }
+
+    /// PREPARATION never sits at 0:00 waiting for a reply: it becomes MATCH
+    /// and counts up, on the line players read in game.
+    #[test]
+    fn preparation_rolls_into_match() {
+        let ending = ClockSnapshot {
+            clock: Clock { phase: ClockPhase::Preparation, seconds: 10, running: true },
+            received_at: Instant::now() - Duration::from_secs(13),
+        };
+        assert_eq!(clock_reading(&ending), (ClockPhase::Match, 3));
+        assert!(clock_pace_line(&ending, None).starts_with("Match: 0:03"));
+
+        let at_zero = ClockSnapshot {
+            clock: Clock { phase: ClockPhase::Preparation, seconds: 10, running: true },
+            received_at: Instant::now() - Duration::from_secs(10),
+        };
+        assert_eq!(clock_reading(&at_zero), (ClockPhase::Match, 0));
+
+        // A stopped prep stays exactly where it was, however long ago.
+        let paused = ClockSnapshot {
+            clock: Clock { phase: ClockPhase::Preparation, seconds: 10, running: false },
+            received_at: Instant::now() - Duration::from_secs(400),
+        };
+        assert_eq!(clock_reading(&paused), (ClockPhase::Preparation, 10));
+    }
+
+    /// A countdown that has run out asks for the next phase; one still running,
+    /// a stopped one and a MATCH clock do not.
+    #[test]
+    fn expired_countdown_asks_early() {
+        let with = |phase, seconds, running, ago| {
+            let status: SharedIngestStatus = Default::default();
+            status.write().unwrap().clock = Some(ClockSnapshot {
+                clock: Clock { phase, seconds, running },
+                received_at: Instant::now() - Duration::from_secs(ago),
+            });
+            status
+        };
+        assert!(countdown_expired(&with(ClockPhase::Starting, 5, true, 6)));
+        assert!(countdown_expired(&with(ClockPhase::Preparation, 5, true, 6)));
+        assert!(!countdown_expired(&with(ClockPhase::Preparation, 5, true, 2)));
+        assert!(!countdown_expired(&with(ClockPhase::Preparation, 5, false, 60)));
+        assert!(!countdown_expired(&with(ClockPhase::Match, 5, true, 60)));
+        assert!(!countdown_expired(&Default::default()));
+    }
+
+    /// Same leniency as the tally , a bad or absent `clock` must not touch
+    /// `tally` or sink the report either.
+    #[test]
+    fn an_unreadable_clock_does_not_sink_the_response() {
+        for weird in [r#""nonsense""#, "42", "null", r#"{"phase":"orbiting"}"#] {
+            let raw = format!(r#"{{"ok":true,"fired":[],"skipped":[],"tally":null,"clock":{weird}}}"#);
+            let r: IngestResponse =
+                serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{weird} broke parsing: {e}"));
+            assert!(r.ok, "{weird} should still be a successful report");
+            assert!(r.clock.is_none(), "{weird} should degrade to no clock");
+        }
     }
 
     #[test]
@@ -1547,14 +2395,17 @@ mod tests {
         }
 
         // One shot taken, so accuracy renders as a number rather than a dash.
+        // No clock in this reply, so it's the tally's two lines alone - no
+        // Pace anywhere, since pace only ever shows next to the clock it was
+        // measured against.
         let status = IngestStatus {
             eligible: true,
             tally: r.tally,
             ..Default::default()
         };
         assert_eq!(
-            status_line(&status).unwrap(),
-            "Hit 0   Miss 1   Total 1   Acc 0%"
+            status_lines(&status),
+            vec!["Hit 0   Miss 1".to_string(), "Total 1   Acc 0%".to_string()]
         );
     }
 
@@ -1569,6 +2420,306 @@ mod tests {
         assert_eq!(r.fired[0].flag, 31150800);
         assert_eq!(r.fired[0].cell, Some(28));
         assert_eq!(r.fired[0].result.as_deref(), Some("miss"));
+    }
+
+    /// A full reply carrying personal bests, in the shape the server sends.
+    const PB_REPLY: &str = r#"{"ok":true,"fired":[],"skipped":[],
+        "tally":{"hits":8,"misses":4,"shots":12,"accuracy":67,"pace":151.0,"sunk":2},
+        "pb":{"hits":19,"sunk":4,"accuracy":83,"pace":132},
+        "pb_beaten":["accuracy"],
+        "clock":{"phase":"match","seconds":2857,"running":true}}"#;
+
+    /// What the Accepted arm writes for a given reply.
+    fn accepted_status(r: IngestResponse) -> IngestStatus {
+        IngestStatus {
+            eligible: true,
+            tally: r.tally,
+            pb: r.pb,
+            pb_beaten: r.pb_beaten,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn parses_pb_and_pb_beaten() {
+        let r: IngestResponse = serde_json::from_str(PB_REPLY).unwrap();
+        assert!(r.ok);
+        assert_eq!(r.tally.unwrap().sunk, 2);
+        let pb = r.pb.expect("pb should parse");
+        assert_eq!(
+            (pb.hits, pb.sunk, pb.accuracy, pb.pace),
+            (Some(19), Some(4), Some(83), Some(132.0))
+        );
+        assert_eq!(r.pb_beaten, vec!["accuracy".to_string()]);
+        assert!(r.clock.is_some());
+    }
+
+    /// A best that has not been set yet arrives as `null`, not missing.
+    #[test]
+    fn parses_pb_with_null_fields() {
+        let raw = r#"{"ok":true,"tally":{"hits":1,"misses":0,"shots":1,"accuracy":100},
+            "pb":{"hits":19,"sunk":null,"accuracy":null,"pace":null}}"#;
+        let r: IngestResponse = serde_json::from_str(raw).expect("null PB fields must parse");
+        let pb = r.pb.expect("pb should survive nulls");
+        assert_eq!(
+            (pb.hits, pb.sunk, pb.accuracy, pb.pace),
+            (Some(19), None, None, None)
+        );
+        assert!(r.pb_beaten.is_empty());
+
+        // Only hits has a best, so only hits gets brackets.
+        let s = accepted_status(r);
+        assert_eq!(
+            status_lines_with_pb(&s),
+            vec![
+                "Hit 1   Miss 0  (19)".to_string(),
+                "Total 1   Acc 100%".to_string(),
+                "Sunk 0".to_string(),
+            ]
+        );
+    }
+
+    /// No `pb` at all: first game, older server, or a failed lookup.
+    #[test]
+    fn no_pb_means_no_pb_line_and_unchanged_tally() {
+        let raw = r#"{"ok":true,"fired":[],"skipped":[],
+            "tally":{"hits":8,"misses":4,"shots":12,"accuracy":67}}"#;
+        let r: IngestResponse = serde_json::from_str(raw).unwrap();
+        assert!(r.pb.is_none());
+        assert!(r.pb_beaten.is_empty());
+
+        let s = accepted_status(r);
+        assert_eq!(
+            status_lines_with_pb(&s),
+            vec![
+                "Hit 8   Miss 4".to_string(),
+                "Total 12   Acc 67%".to_string()
+            ]
+        );
+    }
+
+    /// A PB shape we do not understand must cost us the PB line, never the
+    /// report or the tally.
+    #[test]
+    fn an_unreadable_pb_does_not_sink_the_response() {
+        for weird in ["7", r#""x""#, "[]"] {
+            let raw = format!(
+                r#"{{"ok":true,"tally":{{"hits":8,"misses":4,"shots":12,"accuracy":67}},"pb":{weird},"pb_beaten":["hits"]}}"#
+            );
+            let r: IngestResponse =
+                serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{weird} broke parsing: {e}"));
+            assert!(r.ok, "{weird} should still be a successful report");
+            assert!(r.tally.is_some(), "{weird} must not cost the tally");
+            assert!(r.pb.is_none(), "{weird} should degrade to no pb");
+            let s = accepted_status(r);
+            assert_eq!(
+                status_lines_with_pb(&s),
+                status_lines(&s),
+                "{weird} should add no bests"
+            );
+        }
+
+        let raw = r#"{"ok":true,"tally":{"hits":8,"misses":4,"shots":12,"accuracy":67},
+            "pb":{"hits":19,"sunk":4,"accuracy":83,"pace":132},"pb_beaten":3}"#;
+        let r: IngestResponse = serde_json::from_str(raw).expect("bad pb_beaten must not sink it");
+        assert!(r.ok);
+        assert!(r.tally.is_some());
+        assert!(r.pb.is_some());
+        assert!(
+            r.pb_beaten.is_empty(),
+            "bad pb_beaten should degrade to nothing beaten"
+        );
+    }
+
+    /// The PB reply with a stopped clock attached, so the clock line is stable.
+    fn pb_status_with_clock() -> IngestStatus {
+        IngestStatus {
+            clock: Some(ClockSnapshot {
+                clock: Clock {
+                    phase: ClockPhase::Match,
+                    seconds: 812,
+                    running: false,
+                },
+                received_at: Instant::now(),
+            }),
+            ..accepted_status(serde_json::from_str(PB_REPLY).unwrap())
+        }
+    }
+
+    /// Each best sits in brackets beside its own stat, with Sunk on a row of
+    /// its own, rather than one long PB line that widens the whole panel.
+    #[test]
+    fn bests_sit_beside_their_stats() {
+        let mut s = pb_status_with_clock();
+        s.pb_beaten.clear();
+        assert_eq!(
+            status_lines_with_pb(&s),
+            vec![
+                "Match: 13:32   Pace 2:31  (2:12)".to_string(),
+                "Hit 8   Miss 4  (19)".to_string(),
+                "Total 12   Acc 67%  (83%)".to_string(),
+                "Sunk 2  (4)".to_string(),
+            ]
+        );
+
+        // Accuracy beaten: its best is replaced by NEW, the others are untouched.
+        s.pb_beaten = vec!["accuracy".to_string()];
+        assert_eq!(status_lines_with_pb(&s)[2], "Total 12   Acc 67%  (NEW)");
+    }
+
+    /// A shots best sits beside Total, its own bracket separate from accuracy's.
+    #[test]
+    fn shots_best_sits_beside_total() {
+        let raw = r#"{"ok":true,
+            "tally":{"hits":8,"misses":4,"shots":12,"accuracy":67},
+            "pb":{"hits":19,"sunk":4,"shots":40,"accuracy":83,"pace":132}}"#;
+        let r: IngestResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(r.pb.unwrap().shots, Some(40));
+
+        let mut s = accepted_status(r);
+        assert_eq!(
+            status_lines_with_pb(&s)[1],
+            "Total 12  (40)   Acc 67%  (83%)"
+        );
+
+        s.pb_beaten = vec!["shots".to_string()];
+        assert_eq!(
+            status_lines_with_pb(&s)[1],
+            "Total 12  (NEW)   Acc 67%  (83%)"
+        );
+    }
+
+    /// A one-line `display_text` (Elden Battleship ships "Deaths") joins the
+    /// Sunk row.
+    #[test]
+    fn single_display_line_joins_the_sunk_row() {
+        let mut s = pb_status_with_clock();
+        s.pb_beaten.clear();
+        assert_eq!(
+            combine_with_display_text(&s, true, vec!["Deaths: 0".to_string()]),
+            vec![
+                "Match: 13:32   Pace 2:31  (2:12)".to_string(),
+                "Hit 8   Miss 4  (19)".to_string(),
+                "Total 12   Acc 67%  (83%)".to_string(),
+                "Sunk 2  (4)   Deaths: 0".to_string(),
+            ]
+        );
+    }
+
+    /// Several display lines, no bests, or bests switched off: nothing joins,
+    /// display_text keeps its own rows under the ingest lines.
+    #[test]
+    fn display_text_keeps_its_own_rows_otherwise() {
+        let mut s = pb_status_with_clock();
+        s.pb_beaten.clear();
+        let multi = vec!["IGT: 1:00:00".to_string(), "Deaths: 3".to_string()];
+        let combined = combine_with_display_text(&s, true, multi.clone());
+        assert_eq!(combined[3], "Sunk 2  (4)");
+        assert_eq!(combined[4..], multi[..]);
+
+        let deaths = vec!["Deaths: 0".to_string()];
+        let off = combine_with_display_text(&s, false, deaths.clone());
+        assert_eq!(off.last(), Some(&"Deaths: 0".to_string()));
+        assert_eq!(off.len(), status_lines(&s).len() + 1);
+
+        let no_pb = IngestStatus {
+            pb: None,
+            ..s.clone()
+        };
+        let plain = combine_with_display_text(&no_pb, true, deaths.clone());
+        assert_eq!(plain.last(), Some(&"Deaths: 0".to_string()));
+        assert_eq!(plain.len(), status_lines(&no_pb).len() + 1);
+
+        // Nothing from ingest at all (idle lobby): just display_text.
+        let idle = IngestStatus::default();
+        assert_eq!(
+            combine_with_display_text(&idle, true, deaths.clone()),
+            deaths
+        );
+    }
+
+    /// No clock means no clock line, so the pace best has nowhere to go, the
+    /// same rule as pace itself, which only shows next to its clock.
+    #[test]
+    fn bests_without_a_clock_drop_the_pace_best() {
+        let mut s = accepted_status(serde_json::from_str(PB_REPLY).unwrap());
+        s.pb_beaten.clear();
+        assert_eq!(
+            status_lines_with_pb(&s),
+            vec![
+                "Hit 8   Miss 4  (19)".to_string(),
+                "Total 12   Acc 67%  (83%)".to_string(),
+                "Sunk 2  (4)".to_string(),
+            ]
+        );
+    }
+
+    /// A beaten stat with no current value falls back to the best, unmarked.
+    #[test]
+    fn beaten_stat_without_a_current_value_shows_the_best() {
+        let mut s = pb_status_with_clock();
+        s.tally.as_mut().unwrap().pace = None;
+        s.pb_beaten = vec!["pace".to_string()];
+        assert_eq!(status_lines_with_pb(&s)[0], "Match: 13:32   Pace -  (2:12)");
+    }
+
+    /// Warning, ineligible or tally-less: exactly the plain lines, no bests.
+    #[test]
+    fn bests_hidden_while_warning_or_ineligible() {
+        let s = pb_status_with_clock();
+        assert_ne!(status_lines_with_pb(&s), status_lines(&s));
+
+        let warning = IngestStatus {
+            warn: true,
+            ..s.clone()
+        };
+        assert_eq!(status_lines_with_pb(&warning), status_lines(&warning));
+
+        let ineligible = IngestStatus {
+            eligible: false,
+            ..s.clone()
+        };
+        assert_eq!(status_lines_with_pb(&ineligible), status_lines(&ineligible));
+
+        let no_tally = IngestStatus { tally: None, ..s };
+        assert_eq!(status_lines_with_pb(&no_tally), status_lines(&no_tally));
+    }
+
+    #[test]
+    fn lines_with_bests_are_ascii() {
+        let mut s = pb_status_with_clock();
+        s.pb_beaten = ["hits", "sunk", "accuracy", "pace"]
+            .iter()
+            .map(|x| x.to_string())
+            .collect();
+        let lines = status_lines_with_pb(&s);
+        assert_eq!(
+            lines,
+            vec![
+                "Match: 13:32   Pace 2:31  (NEW)".to_string(),
+                "Hit 8   Miss 4  (NEW)".to_string(),
+                "Total 12   Acc 67%  (NEW)".to_string(),
+                "Sunk 2  (NEW)".to_string(),
+            ]
+        );
+        for line in &lines {
+            assert!(line.is_ascii(), "must render in the embedded font: {line}");
+        }
+    }
+
+    #[test]
+    fn tally_sunk_defaults_to_zero_when_absent() {
+        let r: IngestResponse = serde_json::from_str(
+            r#"{"ok":true,"tally":{"hits":8,"misses":4,"shots":12,"accuracy":67}}"#,
+        )
+        .unwrap();
+        assert_eq!(r.tally.unwrap().sunk, 0);
+
+        let r: IngestResponse = serde_json::from_str(
+            r#"{"ok":true,"tally":{"hits":8,"misses":4,"shots":12,"accuracy":67,"sunk":3}}"#,
+        )
+        .unwrap();
+        assert_eq!(r.tally.unwrap().sunk, 3);
     }
 
     fn manual_attempt_class(attempt: &Attempt) -> &'static str {
@@ -1608,6 +2759,7 @@ mod tests {
             &agent,
             &url,
             &build_body(&token, &empty).unwrap(),
+            pin_region(&url, 1),
         )) {
             "accepted" => println!("accepted"),
             "ineligible" => println!("ineligible (expected while idle)"),
@@ -1620,7 +2772,7 @@ mod tests {
         // rejection rather than something we would sit and retry.
         let bogus = build_body(&"0".repeat(48), &empty).unwrap();
         assert_eq!(
-            manual_attempt_class(&send_once(&agent, &url, &bogus)),
+            manual_attempt_class(&send_once(&agent, &url, &bogus, pin_region(&url, 1))),
             "rejected",
             "an unknown token must be a permanent rejection"
         );

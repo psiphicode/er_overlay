@@ -8,7 +8,10 @@ use imgui::Ui;
 
 use crate::{
     RENDERER_INITIALIZED, debug_log,
-    ingest::{IngestStatus, ReporterController, SharedIngestStatus, create_status, status_line},
+    ingest::{
+        IngestStatus, ReporterController, SharedIngestStatus, combine_with_display_text,
+        create_status,
+    },
     overlay::{
         boss_panel::BossPanel,
         config::{ConfigManager, RuntimeConfig},
@@ -47,18 +50,25 @@ pub struct EROverlayUi {
     reporter: ReporterController,
 }
 
+/// Prepends the ingest status ahead of whatever `display_text` produced,
+/// rather than appending it after: Elden Battleship's own match clock and
+/// pace read as this feature's headline (see status_lines' doc comment),
+/// which only makes sense sitting above a player's own display_text lines
+/// (IGT, deaths, whatever they've configured), not below them. Personal
+/// bests ride beside the stats they belong to, and a one-line display_text
+/// can join the Sunk row (see combine_with_display_text).
 fn append_ingest_text(
     model: &mut OverlayViewModel,
     show_ingest_tally: bool,
+    show_pb: bool,
     show_expanded_error: bool,
     status: &IngestStatus,
 ) -> Option<String> {
     if !show_ingest_tally {
         return None;
     }
-    if let Some(line) = status_line(status) {
-        model.lines.push(line);
-    }
+    let display = std::mem::take(&mut model.lines);
+    model.lines = combine_with_display_text(status, show_pb, display);
     show_expanded_error
         .then(|| status.last_error.clone())
         .flatten()
@@ -316,8 +326,15 @@ impl ImguiRenderLoop for EROverlayUi {
                 .config
                 .as_ref()
                 .is_some_and(|config| config.show_ingest_tally);
+            let show_pb = self.config.as_ref().is_some_and(|config| config.show_pb);
             let ingest_error = self.ingest_status.read().ok().and_then(|status| {
-                append_ingest_text(&mut model, show_ingest_tally, self.full_mode, &status)
+                append_ingest_text(
+                    &mut model,
+                    show_ingest_tally,
+                    show_pb,
+                    self.full_mode,
+                    &status,
+                )
             });
             (model, ingest_error)
         };
@@ -404,7 +421,7 @@ impl ImguiRenderLoop for EROverlayUi {
 
 #[cfg(test)]
 mod tests {
-    use crate::ingest::{IngestStatus, Tally};
+    use crate::ingest::{IngestStatus, Pb, Tally};
 
     use super::{OverlayViewModel, append_ingest_text};
 
@@ -425,20 +442,28 @@ mod tests {
                 misses: 4,
                 shots: 12,
                 accuracy: Some(67),
+                pace: None,
+                sunk: 0,
             }),
+            clock: None,
+            pb: None,
+            pb_beaten: Vec::new(),
             warn: true,
             last_error: Some("server error".to_string()),
             kills_tracked: 2,
         };
 
-        let expanded_error = append_ingest_text(&mut model, false, true, &status);
+        let expanded_error = append_ingest_text(&mut model, false, true, true, &status);
 
         assert_eq!(model.lines, ["normal"]);
         assert_eq!(expanded_error, None);
     }
 
+    /// The ingest lines land BEFORE `display_text`'s own lines ("normal"
+    /// here) - see the doc comment on append_ingest_text - and split into
+    /// hit/miss and total/accuracy, with the failure marker on the last one.
     #[test]
-    fn ingest_text_includes_compact_line_and_expanded_error() {
+    fn ingest_text_includes_compact_lines_and_expanded_error() {
         let mut model = model();
         let status = IngestStatus {
             eligible: true,
@@ -447,17 +472,22 @@ mod tests {
                 misses: 4,
                 shots: 12,
                 accuracy: Some(67),
+                pace: None,
+                sunk: 0,
             }),
+            clock: None,
+            pb: None,
+            pb_beaten: Vec::new(),
             warn: true,
             last_error: Some("server error".to_string()),
             kills_tracked: 2,
         };
 
-        let expanded_error = append_ingest_text(&mut model, true, true, &status);
+        let expanded_error = append_ingest_text(&mut model, true, true, true, &status);
 
         assert_eq!(
             model.lines,
-            ["normal", "Hit 8   Miss 4   Total 12   Acc 67%   [!]"]
+            ["Hit 8   Miss 4", "Total 12   Acc 67%   [!]", "normal"]
         );
         assert_eq!(expanded_error.as_deref(), Some("server error"));
     }
@@ -468,17 +498,63 @@ mod tests {
         let status = IngestStatus {
             eligible: true,
             tally: Some(Tally::default()),
+            clock: None,
+            pb: None,
+            pb_beaten: Vec::new(),
             warn: true,
             last_error: Some("server error".to_string()),
             kills_tracked: 2,
         };
 
-        let expanded_error = append_ingest_text(&mut model, true, false, &status);
+        let expanded_error = append_ingest_text(&mut model, true, true, false, &status);
 
         assert_eq!(
             model.lines,
-            ["normal", "Hit 0   Miss 0   Total 0   Acc -   [!]"]
+            ["Hit 0   Miss 0", "Total 0   Acc -   [!]", "normal"]
         );
         assert_eq!(expanded_error, None);
+    }
+
+    /// Bests sit beside their stats, a one-line `display_text` ("normal" here)
+    /// joins the Sunk row, and `show_pb = false` puts everything back as it was.
+    #[test]
+    fn bests_sit_beside_the_tally_and_can_be_switched_off() {
+        let status = IngestStatus {
+            eligible: true,
+            tally: Some(Tally {
+                hits: 8,
+                misses: 4,
+                shots: 12,
+                accuracy: Some(67),
+                pace: None,
+                sunk: 2,
+            }),
+            pb: Some(Pb {
+                hits: Some(19),
+                sunk: Some(4),
+                shots: Some(40),
+                accuracy: Some(83),
+                pace: Some(132.0),
+            }),
+            ..Default::default()
+        };
+
+        let mut shown = model();
+        append_ingest_text(&mut shown, true, true, false, &status);
+        assert_eq!(
+            shown.lines,
+            [
+                "Hit 8   Miss 4  (19)",
+                "Total 12  (40)   Acc 67%  (83%)",
+                "Sunk 2  (4)   normal",
+            ]
+        );
+
+        let mut hidden = model();
+        append_ingest_text(&mut hidden, true, false, false, &status);
+        assert_eq!(
+            hidden.lines,
+            ["Hit 8   Miss 4", "Total 12   Acc 67%", "normal"]
+        );
     }
 }

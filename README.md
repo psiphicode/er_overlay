@@ -70,6 +70,22 @@ Hit 8   Miss 4   Total 12   Acc 67%
 reason below the normal overlay lines. Set `show_ingest_tally = false` under
 `[overlay]` to hide both status messages.
 
+When the server also sends this player's personal bests for the board, each
+best appears in brackets beside the stat it belongs to, with a Sunk row added:
+
+```text
+Prep: 3:25   Pace -  (2:23)
+Hit 0   Miss 0  (27)
+Total 0  (40)   Acc -  (71%)
+Sunk 0  (4)   Deaths: 0
+```
+
+A best not set yet gets no brackets. A stat the current match already beats
+(the server decides which) shows `(NEW)` instead. If `display_text` is a single
+line, like `Deaths: {deaths}` above, it goes on the end of the Sunk row rather
+than a row of its own; a multi-line `display_text` keeps its own rows. Nothing
+needs configuring; set `show_pb = false` under `[overlay]` to hide the bests.
+
 ## Victory conditions
 
 Victory tracking is disabled by default:

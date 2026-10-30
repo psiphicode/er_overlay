@@ -328,7 +328,8 @@
     "regions": [ 6940, 6941 ],
     "bosses": [
       { "boss": "[32] Divine Beast Dancing Lion", "place": "", "flag_id": 2046460800 },
-      { "boss": "[32] Romina, Saint of the Bud", "place": "Church of the Bud", "flag_id": 2044450800, "rememberance": 21 }
+      { "boss": "[32] Romina, Saint of the Bud", "place": "Church of the Bud", "flag_id": 2044450800, "rememberance": 21 },
+      { "boss": "[32] Crucible Knight Devonia", "place": "", "flag_id": 2045470200 }
     ],
     "dlc": 1
   },

@@ -63,6 +63,8 @@ data_file="all_bosses.json"
 # closed_width=320
 # Show server-reported Automark status in the overlay when reporting is enabled.
 show_ingest_tally = true
+# Show your personal bests from the server beside that status. On if left out.
+show_pb = true
 # how to display the text on the overlay
 # display text = "IGT: {igt}$nBosses: {kills}/{total}$nGreat Runes: {runes}$nShards: {shards}$nDeaths: {deaths}"
 #  $n = newline

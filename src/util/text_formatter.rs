@@ -25,7 +25,7 @@ pub fn format_display_text(template: &str, vars: &HashMap<&str, String>) -> Vec<
             }
         } else if chars[i] == '$' && i + 1 < chars.len() && chars[i + 1] == 'n' {
             // newline escape → push current line, start new one
-            lines.push(format!(" {} ", current));
+            lines.push(current);
             current = String::new();
             i += 2;
             continue;
@@ -35,7 +35,7 @@ pub fn format_display_text(template: &str, vars: &HashMap<&str, String>) -> Vec<
     }
 
     if !current.is_empty() {
-        lines.push(format!(" {} ", current));
+        lines.push(current);
     }
 
     lines

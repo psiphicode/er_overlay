@@ -147,7 +147,7 @@ mod tests {
             TimerSettings::default(),
             Some("Bosses: {kills}/{total}$n{igt}"),
         );
-        assert_eq!(model.lines, [" Bosses: 0/0 ", " 00:00:00 "]);
+        assert_eq!(model.lines, ["Bosses: 0/0", "00:00:00"]);
     }
 
     #[test]
@@ -166,7 +166,7 @@ mod tests {
             Some("{kills}/{total} runes={runes}"),
         );
 
-        assert_eq!(model.lines, [" 1/2 runes=7 "]);
+        assert_eq!(model.lines, ["1/2 runes=7"]);
     }
 
     #[test]
@@ -190,6 +190,6 @@ mod tests {
             Some("IGT: {igt}"),
         );
         assert_eq!(complete.title, Some("GOAL COMPLETE"));
-        assert_eq!(complete.lines, [" IGT: 00:00:00 "]);
+        assert_eq!(complete.lines, ["IGT: 00:00:00"]);
     }
 }
