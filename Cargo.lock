@@ -184,7 +184,7 @@ checksum = "c2ea6706d74fca54e15f1d40b5cf7fe7f764aaec61352a9fcec58fe27e042fc8"
 [[package]]
 name = "eldenring"
 version = "0.14.0"
-source = "git+https://github.com/vswarte/fromsoftware-rs#16d266146bcc7e896ac0d9a2c020e0d4c07baf52"
+source = "git+https://github.com/vswarte/fromsoftware-rs#57023153d786c4b13fe95d9170e6dcd9d35093ea"
 dependencies = [
  "bitfield",
  "bitflags 2.13.1",
@@ -216,7 +216,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "er-overlay"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "crossbeam",
  "eldenring",
@@ -265,7 +265,7 @@ dependencies = [
 [[package]]
 name = "fromsoftware-shared"
 version = "0.14.0"
-source = "git+https://github.com/vswarte/fromsoftware-rs#16d266146bcc7e896ac0d9a2c020e0d4c07baf52"
+source = "git+https://github.com/vswarte/fromsoftware-rs#57023153d786c4b13fe95d9170e6dcd9d35093ea"
 dependencies = [
  "bitflags 2.13.1",
  "from-singleton",
@@ -281,7 +281,7 @@ dependencies = [
 [[package]]
 name = "fromsoftware-shared-macros"
 version = "0.14.0"
-source = "git+https://github.com/vswarte/fromsoftware-rs#16d266146bcc7e896ac0d9a2c020e0d4c07baf52"
+source = "git+https://github.com/vswarte/fromsoftware-rs#57023153d786c4b13fe95d9170e6dcd9d35093ea"
 dependencies = [
  "inflections",
  "proc-macro2",
@@ -292,7 +292,7 @@ dependencies = [
 [[package]]
 name = "fromsoftware-shared-stl"
 version = "0.14.0"
-source = "git+https://github.com/vswarte/fromsoftware-rs#16d266146bcc7e896ac0d9a2c020e0d4c07baf52"
+source = "git+https://github.com/vswarte/fromsoftware-rs#57023153d786c4b13fe95d9170e6dcd9d35093ea"
 
 [[package]]
 name = "fxhash"
